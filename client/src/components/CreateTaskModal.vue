@@ -70,7 +70,7 @@ async function create() {
   const path = `Backlog Técnico/${featureName.value}/${fileName.value}.md`
   try {
     const res = await api.create(props.projectId, path, buildBody())
-    if (column.value !== 'backlog') await api.moveCard(props.projectId, res.path, column.value)
+    await api.moveCard(props.projectId, res.path, column.value)
     emit('created', res.path)
   } catch (e) {
     error.value = e.message

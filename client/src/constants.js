@@ -9,7 +9,12 @@ export const COLUMNS = [
 export const COLUMN_LABEL = Object.fromEntries(COLUMNS.map((c) => [c.id, c.label]))
 export const COLUMN_COLOR = Object.fromEntries(COLUMNS.map((c) => [c.id, c.color]))
 
-export const LAYERS = { front: 'Front', back: 'Back', shared: 'Geral', outro: 'Outro' }
+// tipos de drag-and-drop: DND_TASK = qualquer tarefa (sidebar ou quadro);
+// DND_CARD = card que ja esta no quadro (pode voltar para a sidebar)
+export const DND_TASK = 'application/x-cofre-task'
+export const DND_CARD = 'application/x-cofre-card'
+
+export const LAYERS ={ front: 'Front', back: 'Back', shared: 'Geral', outro: 'Outro' }
 
 export const SEV = {
   red: { color: '#f2665f', label: 'Crítico' },
@@ -17,7 +22,35 @@ export const SEV = {
   green: { color: '#4fd18b', label: 'Melhoria' },
 }
 
-const PALETTE = ['#7c6cf2', '#5aa9f5', '#4fd18b', '#f29a5a', '#e06aa8', '#f2c14e', '#5ad1d1']
+// prioridade de execucao (diferente da severidade do diagnostico)
+export const PRIORITIES = {
+  urgente: { label: 'Urgente', color: '#f2665f', icon: 'chevronsUp' },
+  alta: { label: 'Alta', color: '#f29a5a', icon: 'arrowUp' },
+  media: { label: 'Média', color: '#5aa9f5', icon: 'equal' },
+  baixa: { label: 'Baixa', color: '#85868f', icon: 'arrowDown' },
+}
+export const PRIORITY_ORDER = { urgente: 0, alta: 1, media: 2, baixa: 3 }
+
+const todayISO = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+/** Situacao do prazo: 'overdue' (vencido e nao concluido), 'soon' (ate 2 dias) ou 'ok'. */
+export function dueState(card) {
+  if (!card?.due || card.status === 'feito') return 'ok'
+  const today = todayISO()
+  if (card.due < today) return 'overdue'
+  const diff = (new Date(card.due) - new Date(today)) / 86400000
+  return diff <= 2 ? 'soon' : 'ok'
+}
+/** "2026-10-27" -> "27/10" (ou "27/10/2027" fora do ano corrente). */
+export function formatDue(due) {
+  if (!due) return ''
+  const [y, m, d] = due.split('-')
+  return y === String(new Date().getFullYear()) ? `${d}/${m}` : `${d}/${m}/${y}`
+}
+
+const PALETTE =['#7c6cf2', '#5aa9f5', '#4fd18b', '#f29a5a', '#e06aa8', '#f2c14e', '#5ad1d1']
 
 export function colorFor(str = '') {
   let h = 0

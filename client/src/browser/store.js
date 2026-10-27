@@ -2,6 +2,9 @@
 //  - metadados (id, name, createdAt)  -> indice em 'cofre.projects'
 //  - arquivos do cofre                -> { [relPath]: conteudoMarkdown }
 //  - status do kanban                 -> { [relPath]: coluna }
+//  - campos das tarefas               -> { seq, tasks: { [relPath]: { key, priority, due, assignee,
+//                                         labels, points, rank, comments, history } } }
+//    (ficam fora dos .md para nao alterar o cofre original)
 // Tudo no IndexedDB (via idb-keyval). O indice de projetos tambem espelha em
 // localStorage para leitura sincrona rapida na inicializacao.
 
@@ -9,7 +12,10 @@ import { get, set, del } from 'idb-keyval'
 
 const INDEX_KEY = 'cofre.projects'
 const filesKey = (id) => `cofre.files.${id}`
-const kanbanKey = (id) => `cofre.kanban.${id}`
+const kanbanKey = (id) => `cofre.board.${id}`
+// formato antigo: toda tarefa entrava automaticamente no Backlog
+const legacyKanbanKey = (id) => `cofre.kanban.${id}`
+const metaKey = (id) => `cofre.meta.${id}`
 
 function readIndexSync() {
   try { return JSON.parse(localStorage.getItem(INDEX_KEY) || '[]') } catch { return [] }
@@ -36,6 +42,8 @@ export const store = {
     writeIndex(readIndexSync().filter((p) => p.id !== id))
     await del(filesKey(id))
     await del(kanbanKey(id))
+    await del(legacyKanbanKey(id))
+    await del(metaKey(id))
   },
 
   // ---- arquivos do cofre ----
@@ -48,9 +56,27 @@ export const store = {
 
   // ---- status do kanban ----
   async getKanban(id) {
-    return (await get(kanbanKey(id))) || {}
+    const map = await get(kanbanKey(id))
+    if (map) return map
+    // migracao: no formato antigo o Backlog era preenchido automaticamente,
+    // entao so os cards movidos de proposito para outra coluna seguem no quadro
+    const legacy = (await get(legacyKanbanKey(id))) || {}
+    const next = Object.fromEntries(Object.entries(legacy).filter(([, s]) => s !== 'backlog'))
+    await set(kanbanKey(id), next)
+    await del(legacyKanbanKey(id))
+    return next
   },
   async setKanban(id, map) {
     await set(kanbanKey(id), map)
+  },
+
+  // ---- campos das tarefas (prioridade, prazo, comentarios...) ----
+  async getMeta(id) {
+    const m = (await get(metaKey(id))) || {}
+    // wip: { coluna: limite }; sprints: [{ id, name, start, end, goal, state }]
+    return { seq: m.seq || 0, tasks: m.tasks || {}, wip: m.wip || {}, sprints: m.sprints || [] }
+  },
+  async setMeta(id, meta) {
+    await set(metaKey(id), meta)
   },
 }

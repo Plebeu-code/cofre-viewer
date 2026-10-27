@@ -31,13 +31,42 @@ function openAdd() {
   zipName.value = ''
 }
 
+// aceita o .zip do cofre ou um backup .json exportado pelo proprio Cofre Hub
+const isBackup = (f) => /\.json$/i.test(f?.name || '')
+
 function pickFile(file) {
   if (!file) return
-  if (!/\.zip$/i.test(file.name)) { error.value = 'Envie um arquivo .zip do cofre.'; return }
+  if (!/\.(zip|json)$/i.test(file.name)) { error.value = 'Envie o .zip do cofre ou um backup .json do Cofre Hub.'; return }
   error.value = ''
   zipFile.value = file
   zipName.value = file.name
-  if (!name.value.trim()) name.value = file.name.replace(/\.zip$/i, '')
+  if (!name.value.trim()) name.value = file.name.replace(/(\.cofre)?\.(zip|json)$/i, '')
+}
+
+// ---------- exportacao ----------
+const exporting = ref('')
+function download(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+const stamp = () => new Date().toISOString().slice(0, 10)
+const safeName = (n) => n.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'cofre'
+
+async function exportZip(p) {
+  exporting.value = p.id + ':zip'
+  try { download(await api.exportZip(p.id), `${safeName(p.name)}.zip`) } catch (e) { alert(e.message) }
+  finally { exporting.value = '' }
+}
+async function exportBackup(p) {
+  exporting.value = p.id + ':json'
+  try { download(await api.exportBackup(p.id), `${safeName(p.name)}-${stamp()}.cofre.json`) } catch (e) { alert(e.message) }
+  finally { exporting.value = '' }
 }
 
 function onFileChange(e) { pickFile(e.target.files?.[0]) }
@@ -49,8 +78,9 @@ async function add() {
   if (!zipFile.value) { error.value = 'Selecione o .zip do cofre.'; return }
   saving.value = true
   try {
-    const buffer = await zipFile.value.arrayBuffer()
-    const p = await api.importZipProject(name.value.trim(), buffer)
+    const p = isBackup(zipFile.value)
+      ? await api.importBackup(await zipFile.value.text(), name.value.trim())
+      : await api.importZipProject(name.value.trim(), await zipFile.value.arrayBuffer())
     adding.value = false
     emit('changed')
     emit('select', p.id)
@@ -95,6 +125,12 @@ async function remove(p) {
         </div>
         <div style="display:flex; flex-direction:column; gap:2px" @click.stop>
           <button class="icon-btn star" :class="{ on: favorites.has(p.id) }" title="Favoritar" @click="emit('toggle-fav', p.id)"><Icon name="star" :size="15" /></button>
+          <button class="icon-btn" :disabled="!!exporting" title="Exportar cofre (.zip) com as edições feitas aqui" @click="exportZip(p)">
+            <Icon :name="exporting === p.id + ':zip' ? 'refresh' : 'download'" :size="15" />
+          </button>
+          <button class="icon-btn" :disabled="!!exporting" title="Backup completo (.json): cofre, quadro, comentários e histórico" @click="exportBackup(p)">
+            <Icon :name="exporting === p.id + ':json' ? 'refresh' : 'archive'" :size="15" />
+          </button>
           <button class="icon-btn btn-danger" title="Remover" @click="remove(p)"><Icon name="trash" :size="15" /></button>
         </div>
       </div>
@@ -118,7 +154,7 @@ async function remove(p) {
           <div class="dropzone" :class="{ over: dragging, has: zipFile }"
             @click="fileInput.click()"
             @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
-            <input ref="fileInput" type="file" accept=".zip" style="display:none" @change="onFileChange" />
+            <input ref="fileInput" type="file" accept=".zip,.json" style="display:none" @change="onFileChange" />
             <Icon :name="zipFile ? 'check' : 'file'" :size="20" />
             <div v-if="zipFile"><b>{{ zipName }}</b><div class="muted" style="font-size:12px">Clique para trocar</div></div>
             <div v-else>Arraste o .zip aqui ou <span style="color:var(--accent)">clique para selecionar</span></div>
@@ -126,6 +162,9 @@ async function remove(p) {
 
           <p class="muted" style="font-size:12px; margin:10px 0 0">
             Compacte a pasta do cofre (com <code>Backlog Técnico/</code>, <code>Transversais/</code> e os documentos globais) num <code>.zip</code>. Os dados ficam salvos apenas neste navegador.
+          </p>
+          <p class="muted" style="font-size:12px; margin:6px 0 0">
+            Para <b>restaurar um backup</b>, envie o arquivo <code>.cofre.json</code> exportado pelo botão <Icon name="archive" :size="12" /> do projeto. Quadro, comentários e histórico voltam junto.
           </p>
           <p v-if="error" class="err" style="margin-top:10px">{{ error }}</p>
         </div>

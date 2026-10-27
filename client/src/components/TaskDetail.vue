@@ -3,14 +3,17 @@ import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { api } from '../api.js'
 import Icon from './Icon.vue'
-import { COLUMNS, LAYERS, SEV, prettyFolder } from '../constants.js'
+import { COLUMNS, COLUMN_LABEL, LAYERS, SEV, PRIORITIES, prettyFolder, dueState, formatDue, colorFor, initials } from '../constants.js'
 
 const props = defineProps({
   projectId: { type: String, required: true },
   path: { type: String, required: true },
   cards: { type: Array, default: () => [] },
+  assignees: { type: Array, default: () => [] }, // sugestoes de responsavel
+  labels: { type: Array, default: () => [] },    // sugestoes de etiqueta
+  sprints: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['close', 'move', 'saved', 'deleted', 'ask', 'open-doc'])
+const emit = defineEmits(['close', 'move', 'saved', 'updated', 'deleted', 'ask', 'open-doc'])
 
 const md = new MarkdownIt({ html: false, linkify: true })
 
@@ -122,6 +125,135 @@ async function runReview() {
   finally { reviewing.value = false }
 }
 
+// ---------- campos da tarefa (prioridade, responsavel, prazo...) ----------
+async function setField(field, value) {
+  try {
+    await api.updateTask(props.projectId, props.path, { [field]: value })
+    emit('updated')
+  } catch (e) { error.value = e.message }
+}
+function commitAssignee(e) {
+  const v = e.target.value.trim()
+  if (v !== (card.value?.assignee || '')) setField('assignee', v)
+}
+function commitPoints(e) {
+  const v = e.target.value
+  if (String(card.value?.points ?? '') !== v) setField('points', v)
+}
+
+const labelInput = ref('')
+function addLabel() {
+  const v = labelInput.value.replace(/,/g, ' ').trim()
+  labelInput.value = ''
+  if (v && card.value && !card.value.labels.includes(v)) setField('labels', [...card.value.labels, v])
+}
+function removeLabel(l) { setField('labels', card.value.labels.filter((x) => x !== l)) }
+const labelSuggestions = computed(() => props.labels.filter((l) => !card.value?.labels.includes(l)))
+
+// ---------- vinculos ----------
+const byPath = computed(() => new Map(props.cards.map((c) => [c.path, c])))
+const linkGroups = computed(() => {
+  const c = card.value
+  if (!c) return []
+  return [
+    { id: 'blocks', label: 'Bloqueia', paths: c.blocks },
+    { id: 'blocked_by', label: 'É bloqueada por', paths: c.blockedBy },
+    { id: 'relates', label: 'Relacionada a', paths: c.related },
+  ].map((g) => ({ ...g, tasks: g.paths.map((p) => byPath.value.get(p)).filter(Boolean) })).filter((g) => g.tasks.length)
+})
+const linkOpen = ref(false)
+const linkType = ref('blocks')
+const linkTarget = ref('')
+const linkOptions = computed(() => props.cards.filter((c) => c.path !== props.path))
+const optionLabel = (c) => `${c.key} · ${c.title}`
+async function addLink() {
+  const v = linkTarget.value.trim()
+  const target = linkOptions.value.find((c) => optionLabel(c) === v || c.key?.toLowerCase() === v.toLowerCase())
+  if (!target) { error.value = 'Escolha uma tarefa da lista (pela chave ou pelo título).'; return }
+  try {
+    await api.addLink(props.projectId, props.path, linkType.value, target.path)
+    linkTarget.value = ''
+    linkOpen.value = false
+    error.value = ''
+    emit('updated')
+  } catch (e) { error.value = e.message }
+}
+async function removeLink(other) {
+  try { await api.removeLink(props.projectId, props.path, other); emit('updated') } catch (e) { error.value = e.message }
+}
+
+const sprintOptions = computed(() => props.sprints.filter((s) => s.state !== 'closed' || s.id === card.value?.sprint))
+
+// ---------- atividade: comentarios e historico ----------
+const activity = ref({ comments: [], history: [] })
+const activityTab = ref('comments')
+const newComment = ref('')
+const posting = ref(false)
+
+async function loadActivity() {
+  try { activity.value = await api.taskMeta(props.projectId, props.path) } catch { /* sem atividade */ }
+}
+// o historico muda quando qualquer campo da tarefa muda
+watch(() => card.value && [props.path, card.value.status, card.value.priority, card.value.due, card.value.assignee,
+  card.value.labels.join('|'), card.value.points, card.value.sprint,
+  card.value.blocks.length + card.value.blockedBy.length + card.value.related.length], loadActivity, { immediate: true })
+
+async function postComment() {
+  if (!newComment.value.trim() || posting.value) return
+  posting.value = true
+  try {
+    await api.addComment(props.projectId, props.path, newComment.value)
+    newComment.value = ''
+    await loadActivity()
+    emit('updated')
+  } catch (e) { error.value = e.message }
+  finally { posting.value = false }
+}
+async function removeComment(c) {
+  if (!confirm('Excluir este comentário?')) return
+  await api.deleteComment(props.projectId, props.path, c.id)
+  await loadActivity()
+  emit('updated')
+}
+
+const FIELD_LABEL = { priority: 'a prioridade', due: 'o prazo', assignee: 'o responsável', labels: 'as etiquetas', points: 'a estimativa', sprint: 'a sprint' }
+const LINK_LABEL = { blocks: 'bloqueia', blocked_by: 'é bloqueada por', relates: 'relacionada a' }
+const keyOf = (p) => byPath.value.get(p)?.key || p.split('/').pop().replace(/\.md$/, '')
+function fieldValue(field, v) {
+  if (v == null || (Array.isArray(v) && !v.length)) return 'vazio'
+  if (field === 'priority') return PRIORITIES[v]?.label || v
+  if (field === 'sprint') return props.sprints.find((s) => s.id === v)?.name || 'sprint excluída'
+  if (field === 'due') return formatDue(v)
+  if (field === 'labels') return v.join(', ')
+  return String(v)
+}
+const statusName = (s) => (s ? COLUMN_LABEL[s] : 'Fora do quadro')
+const historyRows = computed(() =>
+  [...activity.value.history].reverse().map((h) => {
+    if (h.type === 'status') {
+      if (!h.from) return { ...h, icon: 'board', text: `Adicionada ao quadro em ${statusName(h.to)}` }
+      if (!h.to) return { ...h, icon: 'x', text: `Removida do quadro (estava em ${statusName(h.from)})` }
+      return { ...h, icon: 'send', text: `Movida de ${statusName(h.from)} para ${statusName(h.to)}` }
+    }
+    if (h.type === 'link') {
+      return h.added
+        ? { ...h, icon: 'link', text: `Vínculo adicionado: ${LINK_LABEL[h.link] || h.link} ${keyOf(h.to)}` }
+        : { ...h, icon: 'link', text: `Vínculo removido com ${keyOf(h.to)}` }
+    }
+    return { ...h, icon: 'edit', text: `Alterou ${FIELD_LABEL[h.field] || h.field}: ${fieldValue(h.field, h.from)} → ${fieldValue(h.field, h.to)}` }
+  })
+)
+
+function timeAgo(iso) {
+  const s = (Date.now() - new Date(iso)) / 1000
+  if (s < 60) return 'agora'
+  if (s < 3600) return `há ${Math.floor(s / 60)} min`
+  if (s < 86400) return `há ${Math.floor(s / 3600)} h`
+  if (s < 86400 * 7) return `há ${Math.floor(s / 86400)} d`
+  return new Date(iso).toLocaleDateString('pt-BR')
+}
+const fullDate = (iso) => new Date(iso).toLocaleString('pt-BR')
+
 function onKey(e) {
   if (e.key === 'Escape') {
     if (editing.value && dirty.value && !confirm('Descartar alterações?')) return
@@ -142,6 +274,7 @@ function close() {
   <div class="overlay" @click.self="close">
     <div class="modal wide">
       <div class="modal-head">
+        <span v-if="card?.key" class="task-key" title="Chave da tarefa">{{ card.key }}</span>
         <span class="layer" :class="card?.layer">{{ LAYERS[card?.layer] || 'Documento' }}</span>
         <span class="muted" style="font-size:12px">{{ prettyFolder(card?.feature || '') }}</span>
         <div style="margin-left:auto; display:flex; gap:4px">
@@ -169,14 +302,147 @@ function close() {
           <textarea v-if="editing" v-model="content" rows="28" spellcheck="false"
             style="font-family: ui-monospace, Consolas, monospace; font-size:12.5px; line-height:1.55"></textarea>
           <div v-else class="md" v-html="rendered"></div>
+
+          <!-- Vínculos -->
+          <section v-if="card" class="links">
+            <div class="act-tabs">
+              <h4><Icon name="link" :size="13" /> Vínculos</h4>
+              <button class="btn-ghost" @click="linkOpen = !linkOpen"><Icon name="plus" :size="13" /> Vincular tarefa</button>
+            </div>
+            <div class="clp" :class="{ open: linkOpen }">
+              <div class="clp-in">
+                <div class="link-form">
+                  <select v-model="linkType">
+                    <option value="blocks">Bloqueia</option>
+                    <option value="blocked_by">É bloqueada por</option>
+                    <option value="relates">Relacionada a</option>
+                  </select>
+                  <input v-model="linkTarget" list="link-targets" placeholder="Chave ou título da tarefa" @keydown.enter="addLink" />
+                  <datalist id="link-targets"><option v-for="c in linkOptions" :key="c.path" :value="optionLabel(c)" /></datalist>
+                  <button class="btn-primary" @click="addLink">Vincular</button>
+                </div>
+              </div>
+            </div>
+            <div v-if="card.blocked" class="blocked-note"><Icon name="alert" :size="13" /> Esta tarefa está bloqueada por tarefa(s) ainda não concluída(s).</div>
+            <div v-for="g in linkGroups" :key="g.id" class="link-group">
+              <div class="link-k">{{ g.label }}</div>
+              <div v-for="t in g.tasks" :key="t.path" class="link-item" @click="emit('open-doc', t.path)">
+                <span class="key">{{ t.key }}</span>
+                <span class="t">{{ t.title }}</span>
+                <span class="pill" :class="{ off: !t.status }">{{ t.status ? COLUMN_LABEL[t.status] : 'Fora do quadro' }}</span>
+                <button class="icon-btn" title="Remover vínculo" @click.stop="removeLink(t.path)"><Icon name="x" :size="13" /></button>
+              </div>
+            </div>
+            <div v-if="!linkGroups.length && !linkOpen" class="muted act-empty">Nenhum vínculo.</div>
+          </section>
+
+          <!-- Atividade -->
+          <section v-if="card" class="activity">
+            <div class="act-tabs">
+              <h4>Atividade</h4>
+              <div class="seg">
+                <button :class="{ on: activityTab === 'comments' }" @click="activityTab = 'comments'">
+                  <Icon name="message" :size="12" /> Comentários<span v-if="activity.comments.length"> · {{ activity.comments.length }}</span>
+                </button>
+                <button :class="{ on: activityTab === 'history' }" @click="activityTab = 'history'">
+                  <Icon name="history" :size="12" /> Histórico
+                </button>
+              </div>
+            </div>
+
+            <template v-if="activityTab === 'comments'">
+              <div class="comment-new">
+                <textarea v-model="newComment" rows="2" placeholder="Adicionar um comentário… (Ctrl+Enter para enviar)"
+                  @keydown.ctrl.enter.prevent="postComment" @keydown.meta.enter.prevent="postComment"></textarea>
+                <button class="btn-primary" :disabled="!newComment.trim() || posting" @click="postComment">Comentar</button>
+              </div>
+              <div v-for="c in [...activity.comments].reverse()" :key="c.id" class="comment">
+                <div class="comment-h">
+                  <span class="muted" :title="fullDate(c.at)">{{ timeAgo(c.at) }}</span>
+                  <button class="icon-btn" title="Excluir comentário" @click="removeComment(c)"><Icon name="trash" :size="13" /></button>
+                </div>
+                <div class="comment-b">{{ c.text }}</div>
+              </div>
+              <div v-if="!activity.comments.length" class="muted act-empty">Nenhum comentário ainda.</div>
+            </template>
+
+            <template v-else>
+              <div v-for="(h, i) in historyRows" :key="i" class="hist">
+                <span class="hist-ic"><Icon :name="h.icon" :size="12" /></span>
+                <span class="hist-t">{{ h.text }}</span>
+                <span class="muted hist-d" :title="fullDate(h.at)">{{ timeAgo(h.at) }}</span>
+              </div>
+              <div v-if="!historyRows.length" class="muted act-empty">Nenhuma alteração registrada ainda.</div>
+            </template>
+          </section>
         </div>
 
         <aside class="detail-side">
           <div class="prop">
             <span class="k">Status</span>
-            <select :value="card?.status" :disabled="!card" @change="emit('move', path, $event.target.value)">
+            <select :value="card?.status || ''" :disabled="!card" @change="emit('move', path, $event.target.value)">
+              <option value="">Fora do quadro</option>
               <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ c.label }}</option>
             </select>
+          </div>
+
+          <div v-if="card" class="fields">
+            <div class="fld">
+              <span class="k"><Icon name="arrowUp" :size="12" /> Prioridade</span>
+              <div class="prio-pick">
+                <button v-for="(p, id) in PRIORITIES" :key="id" :class="{ on: card.priority === id }" :title="p.label"
+                  :style="card.priority === id ? { color: p.color, borderColor: p.color } : null"
+                  @click="setField('priority', card.priority === id ? null : id)">
+                  <Icon :name="p.icon" :size="13" :style="{ color: p.color }" /> {{ p.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="fld">
+              <span class="k"><Icon name="user" :size="12" /> Responsável</span>
+              <div class="with-avatar">
+                <span v-if="card.assignee" class="avatar" :style="{ background: colorFor(card.assignee) }">{{ initials(card.assignee) }}</span>
+                <input :value="card.assignee" list="assignee-list" placeholder="Sem responsável"
+                  @change="commitAssignee" @keydown.enter="$event.target.blur()" />
+              </div>
+              <datalist id="assignee-list"><option v-for="a in assignees" :key="a" :value="a" /></datalist>
+            </div>
+
+            <div v-if="sprintOptions.length" class="fld">
+              <span class="k"><Icon name="clock" :size="12" /> Sprint</span>
+              <select :value="card.sprint || ''" @change="setField('sprint', $event.target.value)">
+                <option value="">Sem sprint</option>
+                <option v-for="s in sprintOptions" :key="s.id" :value="s.id">
+                  {{ s.name }}{{ s.state === 'active' ? ' (ativa)' : s.state === 'closed' ? ' (encerrada)' : '' }}
+                </option>
+              </select>
+            </div>
+
+            <div class="fld-row">
+              <div class="fld">
+                <span class="k"><Icon name="calendar" :size="12" /> Prazo</span>
+                <input type="date" :value="card.due || ''" :class="'due-' + dueState(card)" @change="setField('due', $event.target.value)" />
+                <span v-if="dueState(card) === 'overdue'" class="due-note overdue">Atrasada</span>
+                <span v-else-if="dueState(card) === 'soon'" class="due-note soon">Vence em breve</span>
+              </div>
+              <div class="fld" style="max-width:96px">
+                <span class="k">Pontos</span>
+                <input type="number" min="0" step="1" :value="card.points ?? ''" placeholder="—"
+                  @change="commitPoints" @keydown.enter="$event.target.blur()" />
+              </div>
+            </div>
+
+            <div class="fld">
+              <span class="k"><Icon name="tag" :size="12" /> Etiquetas</span>
+              <div class="labels-edit">
+                <span v-for="l in card.labels" :key="l" class="label-chip">
+                  {{ l }} <button title="Remover etiqueta" @click="removeLabel(l)"><Icon name="x" :size="10" /></button>
+                </span>
+                <input v-model="labelInput" list="label-list" placeholder="Adicionar…"
+                  @keydown.enter.prevent="addLabel" @keydown="$event.key === ',' && ($event.preventDefault(), addLabel())" @change="addLabel" />
+              </div>
+              <datalist id="label-list"><option v-for="l in labelSuggestions" :key="l" :value="l" /></datalist>
+            </div>
           </div>
 
           <div v-if="criteria.length" class="prop">

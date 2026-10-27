@@ -1,10 +1,11 @@
 // Kanban no navegador. Cada .md de tarefa vira um card; o status e persistido
 // no store (IndexedDB), nao em .kanban.json. Porta server/kanban.js.
+// Um card so esta NO QUADRO se tiver status salvo; os demais ficam fora
+// (status null) ate serem arrastados da sidebar para uma coluna.
 
 import { listMarkdownFiles } from './vault.js'
 
 export const COLUMNS = ['backlog', 'a-fazer', 'fazendo', 'feito']
-const DEFAULT_COLUMN = 'backlog'
 
 const baseName = (rel) => rel.split('/').pop()
 const dirName = (rel) => rel.split('/').slice(0, -1).join('/')
@@ -45,38 +46,85 @@ function metaOf(content) {
   return { severity, red, yellow, green, heading: h1.trim(), excerpt, checkTotal, checkDone, ids }
 }
 
-/** Monta o board. Pode ajustar o statusMap (defaults/limpeza); devolve tambem
- *  o mapa possivelmente alterado e um flag `changed` para persistir. */
-export function buildBoard(files, statusMapInput) {
+/** Ordem de exibicao: posicao manual (rank) primeiro; sem rank, por pasta e nome. */
+export function compareCards(a, b) {
+  const ra = a.rank ?? Infinity, rb = b.rank ?? Infinity
+  if (ra !== rb) return ra - rb
+  return a.feature.localeCompare(b.feature, 'pt-BR') || a.fileName.localeCompare(b.fileName, 'pt-BR')
+}
+
+/** Monta o board. Pode limpar o statusMap (arquivos removidos/status invalido) e
+ *  completar os campos das tarefas (gera a chave, ex.: LOG-12, para quem nao tem);
+ *  devolve os mapas possivelmente alterados e flags para persistir.
+ *  `cards` traz TODAS as tarefas (ja ordenadas); `columns` so as que estao no quadro. */
+export function buildBoard(files, statusMapInput, metaInput, keyPrefix = 'TSK') {
   const statusMap = { ...(statusMapInput || {}) }
+  const taskMeta = {
+    seq: metaInput?.seq || 0, tasks: { ...(metaInput?.tasks || {}) },
+    wip: { ...(metaInput?.wip || {}) }, sprints: [...(metaInput?.sprints || [])],
+  }
   const taskFiles = listMarkdownFiles(files).filter(isTaskFile)
   let changed = false
+  let metaChanged = false
+
+  // chaves estaveis: atribuidas em ordem de caminho, uma unica vez por arquivo
+  for (const rel of [...taskFiles].sort()) {
+    if (taskMeta.tasks[rel]?.key) continue
+    taskMeta.seq++
+    taskMeta.tasks[rel] = { ...(taskMeta.tasks[rel] || {}), key: `${keyPrefix}-${taskMeta.seq}` }
+    metaChanged = true
+  }
 
   const cards = taskFiles.map((rel) => {
-    let status = statusMap[rel]
-    if (!COLUMNS.includes(status)) {
-      status = DEFAULT_COLUMN
-      if (statusMap[rel] !== status) { statusMap[rel] = status; changed = true }
-    }
+    let status = statusMap[rel] ?? null
+    if (status && !COLUMNS.includes(status)) { status = null; delete statusMap[rel]; changed = true }
     const name = baseName(rel).replace(/\.md$/, '')
     const folder = dirName(rel).split('/').pop()
     const group = rel.toLowerCase().startsWith('transversais') ? 'Transversais' : 'Backlog Técnico'
     const meta = metaOf(files[rel])
     const short = name.includes(' — ') ? name.split(' — ').slice(1).join(' — ') : name
     const kind = name.includes(' — ') ? name.split(' — ')[0] : ''
-    return { path: rel, title: short, kind, fileName: name, feature: folder, group, layer: classifyLayer(name), status, ...meta }
-  })
+    const t = taskMeta.tasks[rel] || {}
+    return {
+      path: rel, title: short, kind, fileName: name, feature: folder, group, layer: classifyLayer(name), status, ...meta,
+      key: t.key, priority: t.priority || null, due: t.due || null, assignee: t.assignee || '',
+      labels: t.labels || [], points: t.points ?? null, rank: t.rank ?? null,
+      sprint: t.sprint || null, links: t.links || [],
+      commentCount: (t.comments || []).length,
+      // quando foi concluida (ultima entrada em "feito"), base do burndown
+      doneAt: status === 'feito' ? [...(t.history || [])].reverse().find((h) => h.type === 'status' && h.to === 'feito')?.at || null : null,
+    }
+  }).sort(compareCards)
+
+  // vinculos: "A bloqueia B" fica salvo em A; B recebe o inverso calculado aqui
+  const byPath = new Map(cards.map((c) => [c.path, c]))
+  for (const c of cards) { c.blockedBy = []; c.related = [] }
+  for (const c of cards) {
+    c.links = c.links.filter((l) => byPath.has(l.to))
+    for (const l of c.links) {
+      if (l.type === 'blocks') byPath.get(l.to).blockedBy.push(c.path)
+      else { c.related.push(l.to); byPath.get(l.to).related.push(c.path) }
+    }
+  }
+  for (const c of cards) {
+    c.blocks = c.links.filter((l) => l.type === 'blocks').map((l) => l.to)
+    c.related = [...new Set(c.related)]
+    c.blocked = c.status !== 'feito' && c.blockedBy.some((p) => byPath.get(p).status !== 'feito')
+  }
 
   const valid = new Set(cards.map((c) => c.path))
   for (const key of Object.keys(statusMap)) {
     if (!valid.has(key)) { delete statusMap[key]; changed = true }
   }
+  for (const key of Object.keys(taskMeta.tasks)) {
+    if (!valid.has(key)) { delete taskMeta.tasks[key]; metaChanged = true }
+  }
 
-  const columns = COLUMNS.map((id) => ({
-    id,
-    cards: cards.filter((c) => c.status === id).sort((a, b) => a.feature.localeCompare(b.feature, 'pt-BR')),
-  }))
-  return { board: { columns, total: cards.length }, statusMap, changed }
+  const columns = COLUMNS.map((id) => ({ id, cards: cards.filter((c) => c.status === id) }))
+  return {
+    board: { columns, cards, total: cards.length, wip: taskMeta.wip, sprints: taskMeta.sprints },
+    statusMap, changed, taskMeta, metaChanged,
+  }
 }
 
 export function countTasks(files) {

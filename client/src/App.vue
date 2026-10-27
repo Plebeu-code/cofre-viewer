@@ -1,7 +1,7 @@
 <script setup>
-import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { api } from './api.js'
-import { COLUMNS, LAYERS, SEV, colorFor, initials, prettyFolder } from './constants.js'
+import { COLUMNS, LAYERS, SEV, DND_TASK, DND_CARD, colorFor, initials, prettyFolder, dueState } from './constants.js'
 import Icon from './components/Icon.vue'
 import KanbanBoard from './components/KanbanBoard.vue'
 import TaskTable from './components/TaskTable.vue'
@@ -12,12 +12,15 @@ import ChatPanel from './components/ChatPanel.vue'
 import FileBrowser from './components/FileBrowser.vue'
 import ProjectsView from './components/ProjectsView.vue'
 import Dashboard from './components/Dashboard.vue'
+import SprintsModal from './components/SprintsModal.vue'
+import RoadmapView from './components/RoadmapView.vue'
 
 // ---------- estado global ----------
 const projects = ref([])
 const currentId = ref(localStorage.getItem('cofre.project') || '')
 const section = ref('tasks')          // home | tasks | docs | insights
-const taskView = ref(localStorage.getItem('cofre.view') || 'kanban') // kanban | table | list
+const taskView = ref(localStorage.getItem('cofre.view') || 'kanban') // kanban | table | list | roadmap
+const lanes = ref(localStorage.getItem('cofre.lanes') || 'none')    // raias: none | feature | priority | assignee
 const board = ref(null)
 const tree = ref([])
 const loading = ref(false)
@@ -25,12 +28,25 @@ const error = ref('')
 const toast = ref('')
 
 const favorites = ref(new Set(JSON.parse(localStorage.getItem('cofre.favs') || '[]')))
-const filters = reactive({ q: '', layer: 'all', severity: 'all', feature: '' })
+// quick: filtros rapidos do quadro (overdue | high | unassigned), como os do Jira
+// sprint: '' = todas, id de uma sprint, ou '__none' = sem sprint
+const filters = reactive({ q: '', layer: 'all', severity: 'all', feature: '', assignee: '', label: '', sprint: '', quick: new Set() })
 const showFilter = ref(false)
-const openGroups = reactive({ favs: true, projects: true, cats: true, docs: false })
+const openGroups = reactive({ favs: true, projects: true })
+// arvore da sidebar: projeto > (Funcionalidades | Documentos) > pasta > arquivo
+const expandedProjects = ref(new Set(JSON.parse(localStorage.getItem('cofre.expanded') || '[]')))
+const subOpen = reactive({})          // `${projeto}:feats|docs` -> aberto?
+const openFeatures = ref(new Set())   // `${projeto}:${funcionalidade}` expandidas
+const projectData = reactive({})      // id -> { board, tree } (o atual + os expandidos)
+let pendingNav = null                 // acao a executar depois de trocar de projeto
+const sideDrag = ref('')              // arquivo sendo arrastado a partir da sidebar
+const sideDropOver = ref(false)       // card do quadro sobre a sidebar (para remover)
 
 const detailPath = ref('')
 const createOpen = ref(false)
+const sprintsOpen = ref(false)
+const helpOpen = ref(false)
+const table = ref(null)               // TaskTable (para limpar a selecao)
 const createColumn = ref('backlog')
 const chatOpen = ref(false)
 const chatSeed = ref(null)            // { text, contextPath }
@@ -49,33 +65,60 @@ async function loadProjects() {
     if (!current.value && projects.value.length) currentId.value = projects.value.find((p) => p.exists)?.id || ''
     if (!hasProjects.value) { section.value = 'home'; currentId.value = '' }
     else if (!currentId.value) section.value = 'home'
+    // descarta dados de projetos removidos e carrega os que estao expandidos
+    const ids = new Set(projects.value.map((p) => p.id))
+    for (const id of Object.keys(projectData)) if (!ids.has(id)) delete projectData[id]
+    for (const id of expandedProjects.value) if (ids.has(id) && id !== currentId.value) ensureProjectData(id)
   } catch (e) { error.value = e.message }
 }
 
 async function loadProject() {
   if (!currentId.value) return
+  const id = currentId.value
   loading.value = true
   error.value = ''
   try {
-    const [b, t] = await Promise.all([api.kanban(currentId.value), api.tree(currentId.value)])
+    const [b, t] = await Promise.all([api.kanban(id), api.tree(id)])
+    if (id !== currentId.value) return // trocou de projeto no meio do carregamento
     board.value = b
     tree.value = t.tree
+    projectData[id] = { board: b, tree: t.tree } // mesmo objeto: a sidebar reflete os moves
   } catch (e) { error.value = e.message }
   finally { loading.value = false }
 }
 
-onMounted(async () => { await loadProjects(); await loadProject() })
+// dados de um projeto que nao e o atual, so para listar na sidebar
+async function ensureProjectData(id) {
+  if (projectData[id]) return
+  try {
+    const [b, t] = await Promise.all([api.kanban(id), api.tree(id)])
+    if (!projectData[id]) projectData[id] = { board: b, tree: t.tree }
+  } catch (e) { notify('Não foi possível carregar o projeto: ' + e.message) }
+}
+
+onMounted(async () => {
+  await loadProjects()
+  if (currentId.value) setExpanded(currentId.value, true)
+  await loadProject()
+})
 
 watch(currentId, (id) => {
   localStorage.setItem('cofre.project', id || '')
   filters.feature = ''
+  filters.assignee = ''
+  filters.label = ''
+  filters.sprint = ''
   detailPath.value = ''
   docFile.value = ''
   docFolder.value = []
   board.value = null
-  loadProject()
+  if (id) setExpanded(id, true)
+  const nav = pendingNav
+  pendingNav = null
+  loadProject().then(() => nav?.())
 })
 watch(taskView, (v) => localStorage.setItem('cofre.view', v))
+watch(lanes, (v) => localStorage.setItem('cofre.lanes', v))
 
 function notify(msg) {
   toast.value = msg
@@ -83,33 +126,73 @@ function notify(msg) {
 }
 
 // ---------- tarefas ----------
-const allCards = computed(() => (board.value ? board.value.columns.flatMap((c) => c.cards) : []))
+// allCards = todas as tarefas do cofre; boardCards = so as que estao no quadro
+const allCards = computed(() => (board.value ? board.value.cards : []))
+const boardCards = computed(() => allCards.value.filter((c) => c.status))
 
 const filteredCards = computed(() => {
   const q = filters.q.trim().toLowerCase()
-  return allCards.value.filter((c) => {
+  return boardCards.value.filter((c) => {
     if (filters.layer !== 'all' && c.layer !== filters.layer) return false
     if (filters.severity === 'none' && c.severity) return false
     if (!['all', 'none'].includes(filters.severity) && c.severity !== filters.severity) return false
     if (filters.feature && c.feature !== filters.feature) return false
-    if (q && !`${c.title} ${c.feature} ${c.kind} ${c.excerpt}`.toLowerCase().includes(q)) return false
+    if (filters.assignee && c.assignee !== filters.assignee) return false
+    if (filters.label && !c.labels.includes(filters.label)) return false
+    if (filters.sprint === '__none' && c.sprint) return false
+    if (filters.sprint && filters.sprint !== '__none' && c.sprint !== filters.sprint) return false
+    if (filters.quick.has('overdue') && dueState(c) !== 'overdue') return false
+    if (filters.quick.has('high') && !['urgente', 'alta'].includes(c.priority)) return false
+    if (filters.quick.has('unassigned') && c.assignee) return false
+    if (q && !`${c.key} ${c.title} ${c.feature} ${c.kind} ${c.excerpt} ${c.assignee} ${c.labels.join(' ')}`.toLowerCase().includes(q)) return false
     return true
   })
 })
+
+// valores existentes no projeto, para filtros e sugestoes de preenchimento
+const assignees = computed(() => [...new Set(allCards.value.map((c) => c.assignee).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR')))
+const labels = computed(() => [...new Set(allCards.value.flatMap((c) => c.labels))].sort((a, b) => a.localeCompare(b, 'pt-BR')))
+const sprints = computed(() => board.value?.sprints || [])
+const activeSprint = computed(() => sprints.value.find((s) => s.state === 'active') || null)
+// total real por coluna (sem filtros), usado no limite de WIP
+const columnCounts = computed(() => Object.fromEntries(COLUMNS.map((c) => [c.id, boardCards.value.filter((x) => x.status === c.id).length])))
+const roadmapCards = computed(() => {
+  const q = filters.q.trim().toLowerCase()
+  return allCards.value.filter((c) => !q || `${c.key} ${c.title} ${c.feature}`.toLowerCase().includes(q))
+})
+const overdueCount = computed(() => boardCards.value.filter((c) => dueState(c) === 'overdue').length)
+
+function toggleQuick(k) {
+  const s = new Set(filters.quick)
+  s.has(k) ? s.delete(k) : s.add(k)
+  filters.quick = s
+}
 
 const columnsView = computed(() =>
   COLUMNS.map((col) => ({ ...col, cards: filteredCards.value.filter((c) => c.status === col.id) }))
 )
 
-const categories = computed(() => {
+// agrupa as tarefas de um projeto por funcionalidade (pasta)
+function groupFeatures(cards) {
   const map = new Map()
-  for (const c of allCards.value) map.set(c.feature, (map.get(c.feature) || 0) + 1)
-  return [...map.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'))
-})
+  for (const c of cards) {
+    if (!map.has(c.feature)) map.set(c.feature, [])
+    map.get(c.feature).push(c)
+  }
+  return [...map.entries()]
+    .map(([name, files]) => ({
+      name,
+      count: files.length,
+      onBoard: files.filter((f) => f.status).length,
+      files: files.sort((a, b) => a.fileName.localeCompare(b.fileName, 'pt-BR')),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'))
+}
+const categories = computed(() => groupFeatures(allCards.value))
 
 const summary = computed(() => {
   const s = { red: 0, yellow: 0, done: 0 }
-  for (const c of allCards.value) {
+  for (const c of boardCards.value) {
     if (c.severity === 'red') s.red++
     if (c.severity === 'yellow') s.yellow++
     if (c.status === 'feito') s.done++
@@ -118,26 +201,96 @@ const summary = computed(() => {
 })
 
 const activeFilterCount = computed(() =>
-  (filters.layer !== 'all') + (filters.severity !== 'all') + Boolean(filters.feature)
+  (filters.layer !== 'all') + (filters.severity !== 'all') + Boolean(filters.feature) + Boolean(filters.assignee) + Boolean(filters.label)
 )
 
-async function moveCard(path, status) {
-  const card = allCards.value.find((c) => c.path === path)
-  if (!card || card.status === status) return
-  const prev = card.status
-  // move otimista entre colunas
-  const from = board.value.columns.find((c) => c.id === prev)
-  const to = board.value.columns.find((c) => c.id === status)
-  from.cards = from.cards.filter((c) => c.path !== path)
-  card.status = status
-  to.cards.push(card)
+// recarrega o board sem o estado de "carregando" (apos moves/edicoes)
+async function refreshBoard() {
+  const id = currentId.value
+  if (!id) return
   try {
-    await api.moveCard(currentId.value, path, status)
+    const b = await api.kanban(id)
+    if (id !== currentId.value) return
+    board.value = b
+    if (projectData[id]) projectData[id].board = b
+  } catch (e) { notify(e.message) }
+}
+
+// status vazio/null tira a tarefa do quadro (ela volta a ficar so na sidebar).
+// beforePath: card antes do qual inserir (ordenacao manual); null = fim da coluna
+async function moveCard(path, status, beforePath = null, patch = null) {
+  status = status || null
+  const card = allCards.value.find((c) => c.path === path)
+  if (!card || (card.status === status && !status)) return
+  // soltar em outra raia (prioridade/responsavel) tambem muda esse campo
+  if (patch) {
+    try { await api.updateTask(currentId.value, path, patch) } catch (e) { notify(e.message) }
+  }
+  const wasOnBoard = Boolean(card.status)
+  card.status = status // otimista: colunas e sidebar derivam do status
+  try {
+    if (status) await api.moveCard(currentId.value, path, status, beforePath)
+    else await api.removeFromBoard(currentId.value, path)
+    if (!status) notify('Tarefa removida do quadro')
+    else if (!wasOnBoard) notify('Tarefa adicionada ao quadro')
+    await refreshBoard() // traz a nova ordem e o historico atualizado
   } catch (e) {
     notify('Não foi possível mover: ' + e.message)
     loadProject()
   }
 }
+
+async function setWip(column, limit) {
+  try { await api.setWip(currentId.value, column, limit); await refreshBoard() } catch (e) { notify(e.message) }
+}
+
+async function onBulk(paths, patch) {
+  try {
+    const r = await api.bulkUpdate(currentId.value, paths, patch)
+    await refreshBoard()
+    notify(`${r.count} tarefa(s) atualizada(s)`)
+    // tirar do quadro remove as tarefas da tabela; a selecao se ajusta sozinha
+  } catch (e) { notify(e.message) }
+}
+
+// ---------- atalhos de teclado ----------
+const SHORTCUTS = [
+  ['c', 'Criar tarefa'], ['/', 'Buscar'], ['1', 'Kanban'], ['2', 'Tabela'], ['3', 'Lista'], ['4', 'Roadmap'],
+  ['g t', 'Ir para Tarefas'], ['g d', 'Ir para Docs'], ['g i', 'Ir para Insights'], ['g p', 'Ir para Projetos'],
+  ['s', 'Gerenciar sprints'], ['a', 'Abrir/fechar assistente'], ['?', 'Mostrar atalhos'], ['Esc', 'Fechar janela / limpar seleção'],
+]
+let gPending = 0
+function onGlobalKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  const el = e.target
+  if (el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) return
+  // com janela aberta, cada janela cuida das proprias teclas
+  if (detailPath.value || createOpen.value || sprintsOpen.value) return
+  if (helpOpen.value) { if (e.key === 'Escape' || e.key === '?') helpOpen.value = false; return }
+  if (e.key === 'Escape') { table.value?.clearSel(); showFilter.value = false; return }
+  if (!hasProjects.value) return
+  if (gPending && Date.now() - gPending < 1200) {
+    gPending = 0
+    const to = { t: 'tasks', d: 'docs', i: 'insights', p: 'home' }[e.key]
+    if (to) { e.preventDefault(); go(to) }
+    return
+  }
+  const k = e.key
+  if (k === 'g') { gPending = Date.now(); return }
+  if (k === '?') { e.preventDefault(); helpOpen.value = true; return }
+  if (k === '/') { e.preventDefault(); document.querySelector('.side-search input')?.focus(); return }
+  if (!current.value) return
+  if (k === 'c') { e.preventDefault(); go('tasks'); newTask() }
+  else if (k === 's') { e.preventDefault(); sprintsOpen.value = true }
+  else if (k === 'a') { e.preventDefault(); chatOpen.value = !chatOpen.value }
+  else if (['1', '2', '3', '4'].includes(k)) {
+    e.preventDefault()
+    go('tasks')
+    taskView.value = ['kanban', 'table', 'list', 'roadmap'][+k - 1]
+  }
+}
+onMounted(() => window.addEventListener('keydown', onGlobalKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKey))
 
 function openTask(path) { detailPath.value = path }
 function newTask(column = 'backlog') { createColumn.value = column; createOpen.value = true }
@@ -156,6 +309,7 @@ async function onTaskDeleted() {
 
 function clearFilters() {
   filters.layer = 'all'; filters.severity = 'all'; filters.feature = ''
+  filters.assignee = ''; filters.label = ''; filters.sprint = ''; filters.quick = new Set()
 }
 
 // ---------- navegação ----------
@@ -178,20 +332,71 @@ function toggleFav(id) {
   localStorage.setItem('cofre.favs', JSON.stringify([...s]))
 }
 
-function pickCategory(name) {
-  filters.feature = filters.feature === name ? '' : name
-  section.value = 'tasks'
+// ---------- arvore da sidebar ----------
+function setExpanded(id, open) {
+  const s = new Set(expandedProjects.value)
+  open ? s.add(id) : s.delete(id)
+  expandedProjects.value = s
+  localStorage.setItem('cofre.expanded', JSON.stringify([...s]))
+  if (open && id !== currentId.value) ensureProjectData(id)
+}
+function toggleProject(id) { setExpanded(id, !expandedProjects.value.has(id)) }
+
+// por padrao Funcionalidades abre e Documentos fica recolhido
+const isSubOpen = (pid, kind) => subOpen[`${pid}:${kind}`] ?? kind === 'feats'
+function toggleSub(pid, kind) { subOpen[`${pid}:${kind}`] = !isSubOpen(pid, kind) }
+
+function toggleFeature(pid, name) {
+  const key = `${pid}:${name}`
+  const s = new Set(openFeatures.value)
+  s.has(key) ? s.delete(key) : s.add(key)
+  openFeatures.value = s
+}
+
+// troca de projeto (se preciso) e so entao executa a navegacao
+function goToProject(id, nav) {
+  if (id === currentId.value) { nav?.(); return }
+  pendingNav = nav
+  currentId.value = id
+}
+function openTaskIn(pid, path) { goToProject(pid, () => openTask(path)) }
+function openDocIn(pid, path) { goToProject(pid, () => openDoc(path)) }
+
+// arrastar um arquivo da sidebar: o quadro precisa estar visivel para receber.
+// So o projeto aberto pode ser arrastado (o Kanban e do projeto atual).
+function onSideDragStart(e, card) {
+  sideDrag.value = card.path
+  e.dataTransfer.effectAllowed = 'move'
+  e.dataTransfer.setData('text/plain', card.path)
+  e.dataTransfer.setData(DND_TASK, card.path)
+  if (section.value !== 'tasks' || taskView.value !== 'kanban') {
+    section.value = 'tasks'
+    taskView.value = 'kanban'
+  }
+}
+function onSideDragEnd() { sideDrag.value = ''; sideDropOver.value = false }
+
+// soltar um card do quadro sobre a sidebar o tira do quadro
+function onSideDragOver(e) {
+  if (!e.dataTransfer.types.includes(DND_CARD)) return
+  e.preventDefault()
+  sideDropOver.value = true
+}
+function onSideDrop(e) {
+  sideDropOver.value = false
+  const path = e.dataTransfer.getData(DND_CARD)
+  if (path) moveCard(path, null)
 }
 
 // pastas de documentos que NAO sao tarefas (consolidados)
-const docFolders = computed(() =>
-  tree.value.filter((n) => n.type === 'dir' && !/^backlog|^transversais/i.test(n.name))
-)
+const docFoldersOf = (t) => (t || []).filter((n) => n.type === 'dir' && !/^backlog|^transversais/i.test(n.name))
 
-function openDocFolder(node) {
-  docFolder.value = [node.name]
-  docFile.value = ''
-  section.value = 'docs'
+function openDocFolderIn(pid, node) {
+  goToProject(pid, () => {
+    docFolder.value = [node.name]
+    docFile.value = ''
+    section.value = 'docs'
+  })
 }
 
 function openDoc(path) {
@@ -208,14 +413,42 @@ function askAboutTask(card) {
   chatOpen.value = true
 }
 
-const filteredProjects = computed(() => {
-  const q = filters.q.trim().toLowerCase()
-  return projects.value.filter((p) => !q || p.name.toLowerCase().includes(q))
-})
 const favProjects = computed(() => projects.value.filter((p) => favorites.value.has(p.id)))
-const filteredCategories = computed(() => {
+
+// Arvore da sidebar. Com busca ativa, um projeto aparece se o nome casar ou se
+// alguma funcionalidade/arquivo dele casar (e ai abre o caminho ate o achado).
+const sideProjects = computed(() => {
   const q = filters.q.trim().toLowerCase()
-  return categories.value.filter((c) => !q || c.name.toLowerCase().includes(q))
+  const out = []
+  for (const p of projects.value) {
+    const data = projectData[p.id]
+    const projHit = !q || p.name.toLowerCase().includes(q)
+    let feats = data ? groupFeatures(data.board.cards) : []
+    let docs = data ? docFoldersOf(data.tree) : []
+    let searchOpen = false
+    if (q && !projHit) {
+      feats = feats
+        .map((c) => {
+          const nameHit = prettyFolder(c.name).toLowerCase().includes(q)
+          const files = nameHit ? c.files : c.files.filter((f) => f.fileName.toLowerCase().includes(q))
+          return { ...c, files, searchOpen: !nameHit && files.length > 0 }
+        })
+        .filter((c) => c.files.length)
+      docs = docs.filter((d) => d.name.toLowerCase().includes(q))
+      if (!feats.length && !docs.length) continue
+      searchOpen = true
+    }
+    out.push({
+      ...p,
+      data,
+      open: expandedProjects.value.has(p.id) || searchOpen,
+      featsOpen: isSubOpen(p.id, 'feats') || (searchOpen && feats.length > 0),
+      docsOpen: isSubOpen(p.id, 'docs') || (searchOpen && docs.length > 0),
+      feats: feats.map((c) => ({ ...c, open: openFeatures.value.has(`${p.id}:${c.name}`) || c.searchOpen })),
+      docs,
+    })
+  }
+  return out
 })
 
 const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documentos', tasks: '' }
@@ -259,50 +492,90 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
           </template>
         </div>
 
-        <!-- Projetos -->
+        <!-- Projetos: cada projeto e uma "pasta" com Funcionalidades e Documentos.
+             Listra amarela = fora do quadro; verde = no quadro. So o projeto aberto
+             pode ter arquivos arrastados para o Kanban. -->
         <div class="side-group">
           <div class="side-group-head" @click="openGroups.projects = !openGroups.projects">
-            <Icon :name="openGroups.projects ? 'chevronDown' : 'chevronRight'" :size="12" /> Todos os projetos
+            <Icon :name="openGroups.projects ? 'chevronDown' : 'chevronRight'" :size="12" /> Projetos
             <button class="icon-btn" style="margin-left:auto; width:22px; height:22px" title="Adicionar projeto"
               @click.stop="go('home'); addProjectSignal++"><Icon name="plus" :size="13" /></button>
           </div>
           <template v-if="openGroups.projects">
-            <div v-for="p in filteredProjects" :key="p.id" class="side-item"
-              :class="{ active: p.id === currentId && section !== 'home' }" @click="selectProject(p.id)">
-              <span class="sq" :style="{ background: colorFor(p.name) }">{{ initials(p.name)[0] }}</span>
-              <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ p.name }}</span>
-              <span class="count">{{ p.taskCount }}</span>
-            </div>
-            <div v-if="!filteredProjects.length" class="side-item muted" style="cursor:default">Nenhum projeto</div>
-          </template>
-        </div>
+            <div v-for="p in sideProjects" :key="p.id" class="proj"
+              :class="{ open: p.open, current: p.id === currentId, 'drop-out': sideDropOver && p.id === currentId }"
+              @dragover="p.id === currentId && onSideDragOver($event)" @dragleave.self="sideDropOver = false"
+              @drop.prevent="p.id === currentId && onSideDrop($event)">
+              <div class="side-item proj-head" :class="{ active: p.id === currentId && section !== 'home' }"
+                :title="p.name" @click="selectProject(p.id)">
+                <button class="tw" :aria-expanded="p.open" :title="p.open ? 'Recolher' : 'Expandir'" @click.stop="toggleProject(p.id)">
+                  <Icon name="chevronRight" :size="12" />
+                </button>
+                <span class="sq" :style="{ background: colorFor(p.name) }">{{ initials(p.name)[0] }}</span>
+                <span class="proj-name">{{ p.name }}</span>
+                <span class="count">{{ p.taskCount }}</span>
+              </div>
 
-        <!-- Categorias (funcionalidades do projeto) -->
-        <div v-if="current" class="side-group">
-          <div class="side-group-head" @click="openGroups.cats = !openGroups.cats">
-            <Icon :name="openGroups.cats ? 'chevronDown' : 'chevronRight'" :size="12" /> Funcionalidades
-          </div>
-          <template v-if="openGroups.cats">
-            <div v-for="c in filteredCategories" :key="c.name" class="side-item"
-              :class="{ active: filters.feature === c.name && section === 'tasks' }" @click="pickCategory(c.name)">
-              <Icon name="hash" :size="14" class="hash" :style="{ color: colorFor(c.name) }" />
-              <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ prettyFolder(c.name) }}</span>
-              <span class="count">{{ c.count }}</span>
-            </div>
-          </template>
-        </div>
+              <div class="clp" :class="{ open: p.open }">
+                <div class="clp-in proj-tree">
+                  <div v-if="!p.data" class="tree-note">Carregando…</div>
+                  <template v-else>
+                    <div v-if="sideDropOver && p.id === currentId" class="side-drop-hint"><Icon name="x" :size="13" /> Solte para remover do quadro</div>
 
-        <!-- Documentos do cofre -->
-        <div v-if="docFolders.length" class="side-group">
-          <div class="side-group-head" @click="openGroups.docs = !openGroups.docs">
-            <Icon :name="openGroups.docs ? 'chevronDown' : 'chevronRight'" :size="12" /> Documentos do cofre
-          </div>
-          <template v-if="openGroups.docs">
-            <div v-for="d in docFolders" :key="d.path" class="side-item" @click="openDocFolder(d)">
-              <Icon name="folder" :size="14" class="hash" />
-              <span>{{ d.name }}</span>
-              <span class="count">{{ d.children.length }}</span>
+                    <!-- Funcionalidades -->
+                    <div class="sub-head" :class="{ open: p.featsOpen }" @click="toggleSub(p.id, 'feats')">
+                      <Icon name="chevronRight" :size="11" class="tw-ic" /> <Icon name="board" :size="13" /> Funcionalidades
+                      <span class="count">{{ p.feats.length }}</span>
+                    </div>
+                    <div class="clp" :class="{ open: p.featsOpen }">
+                      <div class="clp-in sub-tree">
+                        <div v-for="c in p.feats" :key="c.name" class="feat" :class="{ open: c.open }">
+                          <div class="side-item feat-head" :aria-expanded="c.open" @click="toggleFeature(p.id, c.name)">
+                            <Icon name="chevronRight" :size="12" class="feat-chev" />
+                            <Icon name="hash" :size="14" class="hash" :style="{ color: colorFor(c.name) }" />
+                            <span class="feat-name">{{ prettyFolder(c.name) }}</span>
+                            <span class="count" :title="`${c.onBoard} de ${c.count} no quadro`">{{ c.onBoard }}/{{ c.count }}</span>
+                          </div>
+                          <div class="feat-body">
+                            <div class="feat-inner">
+                              <div v-for="(f, i) in c.files" :key="f.path" class="feat-file"
+                                :class="{ on: f.status, dragging: sideDrag === f.path, locked: p.id !== currentId }" :style="{ '--i': i }"
+                                :title="p.id !== currentId ? 'Clique para abrir (troca para este projeto)' : f.status ? 'No quadro · clique para abrir' : 'Fora do quadro · arraste para o Kanban'"
+                                :draggable="p.id === currentId" @dragstart="onSideDragStart($event, f)" @dragend="onSideDragEnd"
+                                @click="openTaskIn(p.id, f.path)">
+                                <span class="stripe"></span>
+                                <span class="fname">{{ f.fileName }}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        <div v-if="!p.feats.length" class="tree-note">Nenhuma funcionalidade</div>
+                      </div>
+                    </div>
+
+                    <!-- Documentos do cofre -->
+                    <template v-if="p.docs.length">
+                      <div class="sub-head" :class="{ open: p.docsOpen }" @click="toggleSub(p.id, 'docs')">
+                        <Icon name="chevronRight" :size="11" class="tw-ic" /> <Icon name="file" :size="13" /> Documentos
+                        <span class="count">{{ p.docs.length }}</span>
+                      </div>
+                      <div class="clp" :class="{ open: p.docsOpen }">
+                        <div class="clp-in sub-tree">
+                          <div v-for="d in p.docs" :key="d.path" class="side-item doc-item"
+                            :class="{ active: p.id === currentId && section === 'docs' && docFolder[0] === d.name }"
+                            @click="openDocFolderIn(p.id, d)">
+                            <Icon name="folder" :size="14" class="hash" />
+                            <span class="feat-name">{{ d.name }}</span>
+                            <span class="count">{{ d.children.length }}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </template>
+                </div>
+              </div>
             </div>
+            <div v-if="!sideProjects.length" class="side-item muted" style="cursor:default">{{ filters.q ? 'Nada encontrado' : 'Nenhum projeto' }}</div>
           </template>
         </div>
       </div>
@@ -320,7 +593,12 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
     <main class="main">
       <header class="header">
         <div class="header-top">
-          <template v-if="section !== 'home' && current">
+          <!-- Insights pode cobrir varios projetos: o escopo fica na propria tela -->
+          <template v-if="section === 'insights' && current">
+            <div class="project-avatar" style="background: var(--accent)"><Icon name="chart" :size="18" /></div>
+            <h1>Insights</h1>
+          </template>
+          <template v-else-if="section !== 'home' && current">
             <div class="project-avatar" :style="{ background: colorFor(current.name) }">{{ initials(current.name) }}</div>
             <h1>{{ section === 'tasks' ? current.name : SECTION_TITLE[section] }}</h1>
             <button class="icon-btn star" :class="{ on: favorites.has(current.id) }" title="Favoritar" @click="toggleFav(current.id)">
@@ -338,22 +616,55 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
                 <span class="sev-dot" :style="{ background: SEV.yellow.color }"></span>{{ summary.yellow }}
               </span>
               <span class="chip" style="cursor:default" title="Concluídas">
-                <Icon name="check" :size="12" /> {{ summary.done }}/{{ allCards.length }}
+                <Icon name="check" :size="12" /> {{ summary.done }}/{{ boardCards.length }}
               </span>
               <button class="icon-btn" title="Recarregar" @click="loadProject"><Icon name="refresh" :size="16" /></button>
               <button class="btn-primary" @click="newTask()"><Icon name="plus" :size="14" /> Nova tarefa</button>
             </template>
           </div>
         </div>
-        <div v-if="current && section !== 'home'" class="header-sub">{{ current.taskCount }} tarefa(s) · cofre importado</div>
+        <div v-if="current && section !== 'home' && section !== 'insights'" class="header-sub">{{ boardCards.length }} de {{ current.taskCount }} tarefa(s) no quadro · cofre importado</div>
 
         <!-- Abas (somente tarefas) -->
         <div v-if="section === 'tasks' && current" class="tabs">
           <button class="tab" :class="{ active: taskView === 'kanban' }" @click="taskView = 'kanban'"><Icon name="board" :size="15" /> Kanban</button>
           <button class="tab" :class="{ active: taskView === 'table' }" @click="taskView = 'table'"><Icon name="table" :size="15" /> Tabela</button>
           <button class="tab" :class="{ active: taskView === 'list' }" @click="taskView = 'list'"><Icon name="list" :size="15" /> Lista</button>
+          <button class="tab" :class="{ active: taskView === 'roadmap' }" @click="taskView = 'roadmap'"><Icon name="calendar" :size="15" /> Roadmap</button>
+
+          <!-- sprint exibida + raias -->
+          <select v-if="taskView !== 'roadmap'" v-model="filters.sprint" class="tab-select" title="Sprint exibida">
+            <option value="">Todas as sprints</option>
+            <option v-if="activeSprint" :value="activeSprint.id">▶ {{ activeSprint.name }} (ativa)</option>
+            <option v-for="s in sprints.filter((s) => s.state === 'planned')" :key="s.id" :value="s.id">{{ s.name }}</option>
+            <option value="__none">Sem sprint</option>
+          </select>
+          <select v-if="taskView === 'kanban'" v-model="lanes" class="tab-select" title="Raias">
+            <option value="none">Sem raias</option>
+            <option value="feature">Raias: funcionalidade</option>
+            <option value="priority">Raias: prioridade</option>
+            <option value="assignee">Raias: responsável</option>
+          </select>
+          <button class="tab" title="Gerenciar sprints" @click="sprintsOpen = true"><Icon name="clock" :size="15" /> Sprints</button>
           <div class="spacer"></div>
 
+          <!-- filtros rapidos -->
+          <button class="qf" :class="{ on: filters.quick.has('overdue') }" :aria-pressed="filters.quick.has('overdue')" @click="toggleQuick('overdue')">
+            <Icon name="clock" :size="13" /> Atrasadas<span v-if="overdueCount" class="qf-n">{{ overdueCount }}</span>
+          </button>
+          <button class="qf" :class="{ on: filters.quick.has('high') }" :aria-pressed="filters.quick.has('high')" @click="toggleQuick('high')">
+            <Icon name="arrowUp" :size="13" /> Alta prioridade
+          </button>
+          <button class="qf" :class="{ on: filters.quick.has('unassigned') }" :aria-pressed="filters.quick.has('unassigned')" @click="toggleQuick('unassigned')">
+            <Icon name="user" :size="13" /> Sem responsável
+          </button>
+
+          <span v-if="filters.assignee" class="chip" @click="filters.assignee = ''">
+            <Icon name="user" :size="11" /> {{ filters.assignee }} <Icon name="x" :size="11" class="x" />
+          </span>
+          <span v-if="filters.label" class="chip" @click="filters.label = ''">
+            <Icon name="tag" :size="11" /> {{ filters.label }} <Icon name="x" :size="11" class="x" />
+          </span>
           <span v-if="filters.feature" class="chip" @click="filters.feature = ''">
             # {{ prettyFolder(filters.feature) }} <Icon name="x" :size="11" class="x" />
           </span>
@@ -376,6 +687,24 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
                 <span v-else class="sev-dot" :style="{ background: SEV[key]?.color || '#55565d', margin: '0 3.5px' }"></span>
                 {{ label }}
               </div>
+              <template v-if="assignees.length">
+                <div class="sep"></div>
+                <div class="h">Responsável</div>
+                <div v-for="a in assignees" :key="a" class="opt" :class="{ on: filters.assignee === a }"
+                  @click="filters.assignee = filters.assignee === a ? '' : a">
+                  <Icon v-if="filters.assignee === a" name="check" :size="14" />
+                  <span v-else class="avatar xs" :style="{ background: colorFor(a) }">{{ initials(a) }}</span>
+                  {{ a }}
+                </div>
+              </template>
+              <template v-if="labels.length">
+                <div class="sep"></div>
+                <div class="h">Etiqueta</div>
+                <div v-for="l in labels" :key="l" class="opt" :class="{ on: filters.label === l }"
+                  @click="filters.label = filters.label === l ? '' : l">
+                  <Icon :name="filters.label === l ? 'check' : 'tag'" :size="14" /> {{ l }}
+                </div>
+              </template>
               <div class="sep"></div>
               <div class="opt" @click="clearFilters(); showFilter = false"><Icon name="x" :size="14" /> Limpar filtros</div>
             </div>
@@ -394,10 +723,14 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
         <template v-else-if="section === 'tasks'">
           <div v-if="loading && !board" class="empty">Carregando tarefas…</div>
           <template v-else-if="board">
-            <KanbanBoard v-if="taskView === 'kanban'" :columns="columnsView" @open="openTask" @move="moveCard" @add="newTask" />
-            <TaskTable v-else-if="taskView === 'table'" :cards="filteredCards" @open="openTask" @move="moveCard" />
+            <KanbanBoard v-if="taskView === 'kanban'" :columns="columnsView" :counts="columnCounts" :wip="board.wip || {}"
+              :lanes="lanes" :assignees="assignees" @open="openTask" @move="moveCard" @add="newTask" @set-wip="setWip" />
+            <TaskTable v-else-if="taskView === 'table'" ref="table" :cards="filteredCards" :assignees="assignees" :sprints="sprints"
+              @open="openTask" @move="moveCard" @bulk="onBulk" />
+            <RoadmapView v-else-if="taskView === 'roadmap'" :cards="roadmapCards" :sprints="sprints"
+              @open="openTask" @sprints="sprintsOpen = true" />
             <TaskList v-else :columns="columnsView" @open="openTask" />
-            <div v-if="!filteredCards.length && allCards.length" class="empty">
+            <div v-if="!filteredCards.length && boardCards.length" class="empty">
               Nenhuma tarefa com esses filtros. <a href="#" style="color:var(--accent)" @click.prevent="clearFilters(); filters.q = ''">Limpar</a>
             </div>
           </template>
@@ -406,7 +739,8 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
         <FileBrowser v-else-if="section === 'docs'" :project-id="currentId" :tree="tree"
           :start-folder="docFolder" :start-file="docFile" @open-task="openTask" @changed="loadProject" />
 
-        <Dashboard v-else-if="section === 'insights'" :project-id="currentId" :cards="allCards" @open="openDoc" />
+        <Dashboard v-else-if="section === 'insights'" :projects="projects" :current-id="currentId" :cards="allCards"
+          @open="(path, pid) => openDocIn(pid || currentId, path)" />
       </div>
 
       <!-- Chat flutuante -->
@@ -419,12 +753,29 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
 
     <!-- Modais -->
     <TaskDetail v-if="detailPath && current" :project-id="currentId" :path="detailPath" :cards="allCards"
-      @close="detailPath = ''" @move="moveCard" @saved="loadProject" @deleted="onTaskDeleted"
+      :assignees="assignees" :labels="labels" :sprints="sprints"
+      @close="detailPath = ''" @move="moveCard" @saved="loadProject" @updated="refreshBoard" @deleted="onTaskDeleted"
       @ask="askAboutTask" @open-doc="openDoc" />
 
     <CreateTaskModal v-if="createOpen && current" :project-id="currentId" :categories="categories"
       :initial-column="createColumn" :initial-feature="filters.feature"
       @close="createOpen = false" @created="onTaskCreated" @open-doc="openDoc" />
+
+    <SprintsModal v-if="sprintsOpen && current" :project-id="currentId" :sprints="sprints" :cards="allCards"
+      @close="sprintsOpen = false" @changed="refreshBoard" />
+
+    <!-- atalhos de teclado -->
+    <div v-if="helpOpen" class="overlay" @click.self="helpOpen = false">
+      <div class="modal" style="width:440px">
+        <div class="modal-head">
+          <Icon name="help" :size="16" /><h3>Atalhos de teclado</h3>
+          <button class="icon-btn" style="margin-left:auto" title="Fechar (Esc)" @click="helpOpen = false"><Icon name="x" :size="16" /></button>
+        </div>
+        <div class="modal-body shortcuts">
+          <div v-for="[k, d] in SHORTCUTS" :key="k" class="sc"><span>{{ d }}</span><kbd v-for="x in k.split(' ')" :key="x">{{ x }}</kbd></div>
+        </div>
+      </div>
+    </div>
 
     <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
