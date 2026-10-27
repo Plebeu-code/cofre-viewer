@@ -2,6 +2,8 @@
 
 > Visualizador e gerenciador **100% front-end** de cofres de documentação de auditoria — estilo Jira, com Kanban, busca, insights e um assistente offline.
 
+🔗 **Demo:** https://cofre-viewer.vercel.app
+
 O Cofre Hub permite **gerenciar múltiplos projetos** de documentação no padrão do cofre (Backlog Técnico, Transversais, Matrizes, Diagnóstico, Inventário). Você importa um cofre por **upload de `.zip`** e passa a visualizar, editar, organizar em Kanban e planejar tarefas com ajuda de um assistente que lê a documentação do projeto.
 
 Não há backend: toda a lógica roda no navegador e **nenhum dado sai da sua máquina**. O build é estático e pode ser hospedado em qualquer lugar (Vercel, GitHub Pages, Netlify, S3…).
