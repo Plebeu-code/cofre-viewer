@@ -14,12 +14,17 @@ Não há backend: toda a lógica roda no navegador e **nenhum dado sai da sua m�
 
 | Área | O que faz |
 |---|---|
-| **Projetos** | Importa cofres por `.zip`, abre e remove projetos; seletor global na sidebar. Vários cofres convivem no mesmo navegador. |
-| **Tarefas** | Três visões: **Kanban** (Backlog / A fazer / Fazendo / Feito, com drag-and-drop), **Tabela** e **Lista**. Filtros por texto, camada (Front/Back/Geral), severidade e feature; favoritos. |
+| **Projetos** | Importa cofres por `.zip`, abre e remove projetos. Na sidebar, cada projeto é uma pasta com suas **Funcionalidades** e **Documentos**. |
+| **Backup** | Exporta o cofre (`.zip`, com as edições feitas no app) e um **backup completo** (`.cofre.json`: quadro, campos, comentários e histórico), restaurável pela importação. |
+| **Kanban único por projeto** | Tarefas entram no quadro arrastando da sidebar (listra amarela = fora do quadro, verde = no quadro). Ordenação manual, **limite de WIP** por coluna e **raias** por funcionalidade, prioridade ou responsável. |
+| **Campos estilo Jira** | Chave da tarefa (ex.: `LP-12`), prioridade, responsável, prazo (com aviso de atraso), etiquetas, estimativa em pontos, sprint, **vínculos** (bloqueia / é bloqueada por / relacionada), **comentários** e **histórico de atividade**. Ficam fora dos `.md`, sem alterar o cofre. |
+| **Visões** | **Kanban**, **Tabela** (com **edição em massa**), **Lista** e **Roadmap** (linha do tempo com sprints e prazos). Filtros rápidos: atrasadas, alta prioridade, sem responsável, por responsável, etiqueta e sprint. |
+| **Sprints** | Criar, iniciar e encerrar sprints; ao encerrar, o que não terminou vai para a próxima. **Burndown** no Insights. |
+| **Atalhos** | `c` criar, `/` buscar, `1`–`4` visões, `g t/d/i/p` navegar, `s` sprints, `?` ajuda. |
 | **Criar tarefa com assistente** | Antes de criar o arquivo, o assistente analisa o rascunho e aponta conflitos (🔴), riscos (🟡), possíveis duplicações, dependências citadas e sugestões de melhoria. |
 | **Assistente (chat lateral)** | Responde perguntas sobre a documentação buscando nos `.md` e citando as fontes (clicáveis). |
 | **Documentos** | Navegação por breadcrumb, render de Markdown, editar / criar / excluir arquivos. No detalhe da tarefa há um botão para **copiar a tarefa inteira**. |
-| **Insights** | Contagens de CONF / RISK / MEL / FRONT / BACK / INT, status do inventário e severidade por documento. |
+| **Insights** | Filtro por **todos os projetos ou projetos específicos**: progresso, cobertura do quadro, pontos de atenção, funcionalidades, camadas, comparativo entre projetos, inventário, documentos por severidade e burndown da sprint. |
 | **Busca** | Full-text dentro do projeto. |
 
 ## 🧱 Stack
@@ -81,7 +86,7 @@ Para plugar um **LLM real**, o ponto de integração está isolado em [`client/s
 
 ## 🔒 Persistência e privacidade
 
-Os cofres importados e o status do Kanban ficam **apenas neste navegador** (IndexedDB + `localStorage`). Limpar os dados do site apaga os projetos. Nada é enviado a nenhum servidor.
+Os cofres importados, o quadro e os campos das tarefas ficam **apenas neste navegador** (IndexedDB + `localStorage`). Limpar os dados do site apaga os projetos — **faça backups** pelo botão 🗄 de cada projeto. Nada é enviado a nenhum servidor.
 
 ## 🗂️ Estrutura
 
