@@ -10,6 +10,13 @@
 
 import { get, set, del } from 'idb-keyval'
 
+// avisa quem quiser saber que um projeto mudou (ex.: sincronizacao automatica)
+const listeners = new Set()
+export function onStoreChange(fn) { listeners.add(fn); return () => listeners.delete(fn) }
+let muted = 0 // gravacoes vindas da propria sincronizacao nao disparam envio
+export async function withoutNotify(fn) { muted++; try { return await fn() } finally { muted-- } }
+const changed = (id) => { if (!muted) for (const fn of listeners) fn(id) }
+
 const INDEX_KEY = 'cofre.projects'
 const filesKey = (id) => `cofre.files.${id}`
 const kanbanKey = (id) => `cofre.board.${id}`
@@ -38,6 +45,9 @@ export const store = {
     writeIndex(list)
     return meta
   },
+  updateProjectMeta(id, patch) {
+    writeIndex(readIndexSync().map((p) => (p.id === id ? { ...p, ...patch } : p)))
+  },
   async removeProject(id) {
     writeIndex(readIndexSync().filter((p) => p.id !== id))
     await del(filesKey(id))
@@ -52,6 +62,7 @@ export const store = {
   },
   async setFiles(id, files) {
     await set(filesKey(id), files)
+    changed(id)
   },
 
   // ---- status do kanban ----
@@ -68,6 +79,7 @@ export const store = {
   },
   async setKanban(id, map) {
     await set(kanbanKey(id), map)
+    changed(id)
   },
 
   // ---- campos das tarefas (prioridade, prazo, comentarios...) ----
@@ -78,5 +90,6 @@ export const store = {
   },
   async setMeta(id, meta) {
     await set(metaKey(id), meta)
+    changed(id)
   },
 }

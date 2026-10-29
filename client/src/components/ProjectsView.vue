@@ -2,6 +2,8 @@
 import { ref, watch } from 'vue'
 import { api } from '../api.js'
 import Icon from './Icon.vue'
+import UpdateVaultModal from './UpdateVaultModal.vue'
+import { download, stamp, safeName } from '../browser/download.js'
 import { colorFor, initials } from '../constants.js'
 
 const props = defineProps({
@@ -10,7 +12,15 @@ const props = defineProps({
   favorites: { type: Object, default: () => new Set() },
   addSignal: { type: Number, default: 0 },
 })
-const emit = defineEmits(['select', 'changed', 'toggle-fav'])
+const emit = defineEmits(['select', 'changed', 'toggle-fav', 'notify'])
+
+const updating = ref(null) // projeto sendo atualizado com nova versao do .zip
+function onUpdated(d) {
+  updating.value = null
+  emit('changed')
+  emit('notify', `Cofre atualizado: ${d.added.length} novo(s), ${d.changed.length} alterado(s), ${d.removed.length} removido(s)`)
+}
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString('pt-BR') : '')
 
 const adding = ref(false)
 const name = ref('')
@@ -45,18 +55,6 @@ function pickFile(file) {
 
 // ---------- exportacao ----------
 const exporting = ref('')
-function download(blob, filename) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-const stamp = () => new Date().toISOString().slice(0, 10)
-const safeName = (n) => n.replace(/[\\/:*?"<>|]+/g, '-').trim() || 'cofre'
 
 async function exportZip(p) {
   exporting.value = p.id + ':zip'
@@ -118,13 +116,16 @@ async function remove(p) {
         <div class="project-avatar" :style="{ background: colorFor(p.name) }">{{ initials(p.name) }}</div>
         <div style="min-width:0; flex:1">
           <div class="nm" style="font-size:14px">{{ p.name }}</div>
-          <div class="sb">Cofre importado</div>
+          <div class="sb">{{ p.updatedAt ? `Atualizado em ${fmtDate(p.updatedAt)}` : 'Cofre importado' }}</div>
           <div class="row" style="margin-top:10px; gap:12px">
             <span class="muted" style="font-size:12px"><b style="color:var(--text)">{{ p.taskCount }}</b> tarefas</span>
           </div>
         </div>
         <div style="display:flex; flex-direction:column; gap:2px" @click.stop>
           <button class="icon-btn star" :class="{ on: favorites.has(p.id) }" title="Favoritar" @click="emit('toggle-fav', p.id)"><Icon name="star" :size="15" /></button>
+          <button class="icon-btn" title="Atualizar cofre com uma nova versão do .zip (mantém quadro e histórico)" @click="updating = p">
+            <Icon name="upload" :size="15" />
+          </button>
           <button class="icon-btn" :disabled="!!exporting" title="Exportar cofre (.zip) com as edições feitas aqui" @click="exportZip(p)">
             <Icon :name="exporting === p.id + ':zip' ? 'refresh' : 'download'" :size="15" />
           </button>
@@ -139,6 +140,8 @@ async function remove(p) {
       </div>
     </div>
     </template>
+
+    <UpdateVaultModal v-if="updating" :project="updating" @close="updating = null" @updated="onUpdated" />
 
     <div v-if="adding" class="overlay" @click.self="adding = false">
       <div class="modal">

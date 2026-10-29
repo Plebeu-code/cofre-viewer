@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import Icon from './Icon.vue'
+import { download, toCsv, taskColumns, stamp } from '../browser/download.js'
 import { COLUMNS, LAYERS, SEV, PRIORITIES, PRIORITY_ORDER, prettyFolder, dueState, formatDue, colorFor, initials } from '../constants.js'
 
 const props = defineProps({
@@ -24,6 +25,10 @@ function toggle(path) {
 function toggleAll() { selected.value = allChecked.value ? new Set() : new Set(visiblePaths.value) }
 function clearSel() { selected.value = new Set() }
 defineExpose({ clearSel, selection })
+
+function exportCsv() {
+  download(toCsv(rows.value, taskColumns({ sprints: props.sprints })), `tarefas-${stamp()}.csv`)
+}
 
 const bulkLabel = ref('')
 function bulk(patch) {
@@ -98,6 +103,11 @@ const arrow = (k) => (sortKey.value === k ? (sortDir.value === 1 ? ' ↑' : ' �
       <button class="icon-btn" style="margin-left:auto" title="Limpar seleção (Esc)" @click="clearSel"><Icon name="x" :size="15" /></button>
     </div>
   </Transition>
+
+  <div class="table-tools">
+    <span class="muted">{{ cards.length }} tarefa(s)</span>
+    <button class="btn" title="Exportar as tarefas listadas (com filtros e ordem atuais)" @click="exportCsv"><Icon name="download" :size="14" /> Exportar CSV</button>
+  </div>
 
   <table class="table">
     <thead>

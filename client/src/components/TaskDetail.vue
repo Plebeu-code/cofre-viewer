@@ -13,7 +13,7 @@ const props = defineProps({
   labels: { type: Array, default: () => [] },    // sugestoes de etiqueta
   sprints: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['close', 'move', 'saved', 'updated', 'deleted', 'ask', 'open-doc'])
+const emit = defineEmits(['close', 'move', 'saved', 'updated', 'delete', 'ask', 'open-doc'])
 
 const md = new MarkdownIt({ html: false, linkify: true })
 
@@ -103,13 +103,8 @@ function toggleCriterion(c) {
   persist(lines.join('\n'))
 }
 
-async function remove() {
-  if (!confirm('Excluir esta tarefa? O arquivo será apagado do cofre.')) return
-  try {
-    await api.remove(props.projectId, props.path)
-    emit('deleted')
-  } catch (e) { error.value = e.message }
-}
+// a exclusao fica com o App, que oferece "Desfazer"
+function remove() { emit('delete', props.path) }
 
 async function runReview() {
   if (!card.value) return
@@ -161,6 +156,27 @@ const linkGroups = computed(() => {
     { id: 'relates', label: 'Relacionada a', paths: c.related },
   ].map((g) => ({ ...g, tasks: g.paths.map((p) => byPath.value.get(p)).filter(Boolean) })).filter((g) => g.tasks.length)
 })
+// sugestoes: IDs citados no texto (FRONT-12...) que outra tarefa define no titulo
+const linkSuggestions = computed(() => {
+  const c = card.value
+  if (!c) return []
+  const linked = new Set([...c.blocks, ...c.blockedBy, ...c.related])
+  const lines = content.value.split(/\r?\n/)
+  const out = []
+  for (const id of c.ids) {
+    if (c.defines.includes(id)) continue
+    const target = props.cards.find((x) => x.path !== c.path && x.defines.includes(id))
+    if (!target || linked.has(target.path) || out.some((o) => o.target.path === target.path)) continue
+    const line = lines.find((l) => l.includes(id)) || ''
+    const type = /depend|bloque|requer|pr[ée]-?requisito|ap[óo]s/i.test(line) ? 'blocked_by' : 'relates'
+    out.push({ id, target, type, line: line.replace(/[*#>`_-]/g, ' ').trim().slice(0, 110) })
+  }
+  return out
+})
+async function acceptSuggestion(s) {
+  try { await api.addLink(props.projectId, props.path, s.type, s.target.path); emit('updated') } catch (e) { error.value = e.message }
+}
+
 const linkOpen = ref(false)
 const linkType = ref('blocks')
 const linkTarget = ref('')
@@ -235,6 +251,7 @@ const historyRows = computed(() =>
       if (!h.to) return { ...h, icon: 'x', text: `Removida do quadro (estava em ${statusName(h.from)})` }
       return { ...h, icon: 'send', text: `Movida de ${statusName(h.from)} para ${statusName(h.to)}` }
     }
+    if (h.type === 'file') return { ...h, icon: 'upload', text: 'Conteúdo do arquivo mudou numa nova versão do cofre' }
     if (h.type === 'link') {
       return h.added
         ? { ...h, icon: 'link', text: `Vínculo adicionado: ${LINK_LABEL[h.link] || h.link} ${keyOf(h.to)}` }
@@ -333,7 +350,15 @@ function close() {
                 <button class="icon-btn" title="Remover vínculo" @click.stop="removeLink(t.path)"><Icon name="x" :size="13" /></button>
               </div>
             </div>
-            <div v-if="!linkGroups.length && !linkOpen" class="muted act-empty">Nenhum vínculo.</div>
+            <div v-if="!linkGroups.length && !linkOpen && !linkSuggestions.length" class="muted act-empty">Nenhum vínculo.</div>
+            <div v-if="linkSuggestions.length" class="link-group">
+              <div class="link-k"><Icon name="sparkle" :size="11" /> Sugeridos pelos IDs citados no texto</div>
+              <div v-for="s in linkSuggestions" :key="s.target.path" class="link-item sugg" :title="s.line">
+                <span class="key">{{ s.id }}</span>
+                <span class="t">{{ s.type === 'blocked_by' ? 'É bloqueada por' : 'Relacionada a' }} {{ s.target.key }} · {{ s.target.title }}</span>
+                <button class="btn" @click.stop="acceptSuggestion(s)">Vincular</button>
+              </div>
+            </div>
           </section>
 
           <!-- Atividade -->

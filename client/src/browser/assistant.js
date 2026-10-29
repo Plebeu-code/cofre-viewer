@@ -3,6 +3,7 @@
 
 import { listMarkdownFiles } from './vault.js'
 
+// o modo com IA (Claude) fica em ./llm.js e e ativado nas Configuracoes
 export const HAS_LLM = false
 
 function indexVault(files) {
@@ -46,6 +47,11 @@ function rank(docs, text, limit = 5) {
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
+}
+
+/** Documentos mais relevantes para um texto (usado como contexto pelo modo com IA). */
+export function retrieve(files, text, limit = 8) {
+  return rank(indexVault(files), text, limit).map(({ doc }) => doc)
 }
 
 function snippet(content, kws, len = 220) {

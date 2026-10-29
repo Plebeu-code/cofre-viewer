@@ -7,7 +7,8 @@ defineProps({ card: { type: Object, required: true } })
 </script>
 
 <template>
-  <article class="card" :class="{ blocked: card.blocked }" draggable="true">
+  <article class="card" :class="{ blocked: card.blocked }" draggable="true" tabindex="0" role="button" :data-path="card.path"
+    :aria-label="`${card.key} ${card.title}. Enter abre; setas navegam; Shift+setas movem o card.`">
     <div class="card-top">
       <div class="bar" :style="{ background: barColor(card) }"></div>
       <span class="feature">{{ prettyFolder(card.feature) }}</span>

@@ -7,7 +7,8 @@
     "dev": "npm --prefix client run dev",
     "build": "npm --prefix client install && npm --prefix client run build",
     "preview": "npm --prefix client run preview",
-    "install:all": "npm --prefix client install"
+    "install:all": "npm --prefix client install",
+    "test": "npm --prefix client test"
   },
   "engines": {
     "node": ">=18"

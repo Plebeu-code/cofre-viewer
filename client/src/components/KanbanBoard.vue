@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, nextTick } from 'vue'
+import { ref, reactive, computed, nextTick, watch } from 'vue'
 import Icon from './Icon.vue'
 import TaskCard from './TaskCard.vue'
 import { PRIORITIES, prettyFolder, colorFor, initials, DND_TASK, DND_CARD } from '../constants.js'
@@ -82,6 +82,45 @@ function onDrop(e, colId, lane = null) {
 const isOver = (zone) => over.value === zone
 const dropEnd = (zone, cards) => isOver(zone) && !dropBefore.value && dragPath.value !== cards.at(-1)?.path
 
+// ---------- teclado ----------
+// setas: navegar entre cards; Shift+esquerda/direita: mudar de coluna;
+// Shift+cima/baixo: reordenar; Enter/Espaco: abrir
+const pendingFocus = ref('')
+function focusCard(path) {
+  const el = path && document.querySelector('.card[data-path="' + CSS.escape(path) + '"]')
+  el?.focus()
+  return Boolean(el)
+}
+watch(() => props.columns, async () => {
+  if (!pendingFocus.value) return
+  await nextTick()
+  if (focusCard(pendingFocus.value)) pendingFocus.value = ''
+}, { deep: true })
+
+function onCardKey(e, cols, ci, i, lane = null) {
+  const col = cols[ci]
+  const card = col.cards[i]
+  const k = e.key
+  if (k === 'Enter' || k === ' ') { e.preventDefault(); emit('open', card.path); return }
+  if (!k.startsWith('Arrow')) return
+  e.preventDefault()
+  if (e.shiftKey) {
+    pendingFocus.value = card.path
+    if (k === 'ArrowLeft' && ci > 0) emit('move', card.path, cols[ci - 1].id, null, null)
+    else if (k === 'ArrowRight' && ci < cols.length - 1) emit('move', card.path, cols[ci + 1].id, null, null)
+    else if (k === 'ArrowUp' && i > 0) emit('move', card.path, col.id, col.cards[i - 1].path, null)
+    else if (k === 'ArrowDown' && i < col.cards.length - 1) emit('move', card.path, col.id, col.cards[i + 2]?.path || null, null)
+    else pendingFocus.value = ''
+    return
+  }
+  const target =
+    k === 'ArrowUp' ? col.cards[i - 1]
+    : k === 'ArrowDown' ? col.cards[i + 1]
+    : k === 'ArrowLeft' ? (cols[ci - 1]?.cards[Math.min(i, cols[ci - 1].cards.length - 1)])
+    : (cols[ci + 1]?.cards[Math.min(i, cols[ci + 1].cards.length - 1)])
+  if (target) focusCard(target.path)
+}
+
 // ---------- limite de WIP ----------
 const editingWip = ref('')
 const wipInput = ref(null)
@@ -103,7 +142,7 @@ const overWip = (colId) => props.wip[colId] && (props.counts[colId] || 0) > prop
   <!-- ===== Quadro simples ===== -->
   <div v-if="lanes === 'none'" class="board">
     <section
-      v-for="col in columns"
+      v-for="(col, ci) in columns"
       :key="col.id"
       class="column"
       :class="{ over: isOver('|' + col.id), 'wip-over': overWip(col.id) }"
@@ -129,6 +168,7 @@ const overWip = (colId) => props.wip[colId] && (props.counts[colId] || 0) > prop
           :class="{ dragging: dragPath === card.path, 'drop-before': isOver('|' + col.id) && dropBefore === card.path && dragPath !== card.path }"
           @dragstart="onDragStart($event, card)" @dragend="onDragEnd"
           @dragover="onCardOver($event, col.cards, i)" @click="emit('open', card.path)"
+          @keydown="onCardKey($event, columns, ci, i)"
         />
         <div v-if="!col.cards.length" class="column-empty">
           <Icon name="plus" :size="14" /> Arraste tarefas da sidebar
@@ -164,7 +204,7 @@ const overWip = (colId) => props.wip[colId] && (props.counts[colId] || 0) > prop
       <div class="clp" :class="{ open: !collapsed[lane.key] }">
         <div class="clp-in">
           <div class="lane-row">
-            <div v-for="col in lane.cols" :key="col.id" class="lane-cell" :class="{ over: isOver(lane.key + '|' + col.id) }"
+            <div v-for="(col, ci) in lane.cols" :key="col.id" class="lane-cell" :class="{ over: isOver(lane.key + '|' + col.id) }"
               @dragover="onDragOver($event, lane.key + '|' + col.id)" @dragleave.self="over = ''"
               @drop.prevent="onDrop($event, col.id, lane)">
               <div class="column-cards" :class="{ 'drop-end': dropEnd(lane.key + '|' + col.id, col.cards) }">
@@ -173,6 +213,7 @@ const overWip = (colId) => props.wip[colId] && (props.counts[colId] || 0) > prop
                   :class="{ dragging: dragPath === card.path, 'drop-before': isOver(lane.key + '|' + col.id) && dropBefore === card.path && dragPath !== card.path }"
                   @dragstart="onDragStart($event, card)" @dragend="onDragEnd"
                   @dragover="onCardOver($event, col.cards, i)" @click="emit('open', card.path)"
+                  @keydown="onCardKey($event, lane.cols, ci, i, lane)"
                 />
               </div>
             </div>

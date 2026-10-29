@@ -7,8 +7,14 @@ import { buildTree, normalizeRel, listMarkdownFiles } from './browser/vault.js'
 import { buildStats } from './browser/stats.js'
 import { buildBoard, countTasks, COLUMNS } from './browser/kanban.js'
 import { answer, analyzeDraft, HAS_LLM } from './browser/assistant.js'
-import { importZip } from './browser/importZip.js'
-import JSZip from 'jszip'
+// JSZip so e necessario ao importar/exportar: carregado sob demanda
+const importZip = async (input) => (await import('./browser/importZip.js')).importZip(input)
+const loadJSZip = async () => (await import('jszip')).default
+
+// leitura leve da config da IA (sem importar o SDK no carregamento inicial)
+const llmConfigured = () => {
+  try { return Boolean(JSON.parse(localStorage.getItem('cofre.llm') || '{}').apiKey) } catch { return false }
+}
 
 const BACKUP_FORMAT = 'cofre-hub-backup'
 const TASK_FIELDS = ['priority', 'due', 'assignee', 'labels', 'points', 'sprint']
@@ -86,6 +92,19 @@ function cleanField(field, value) {
   return String(value || '').trim() || null
 }
 
+/** Diferenca entre duas versoes do cofre; `tasks*` sao as que viram cards. */
+export function diffVault(current, next) {
+  const added = Object.keys(next).filter((k) => !(k in current)).sort()
+  const removed = Object.keys(current).filter((k) => !(k in next)).sort()
+  const changed = Object.keys(next).filter((k) => k in current && current[k] !== next[k]).sort()
+  const isTask = (p) => countTasks({ [p]: '' }) > 0
+  return {
+    added, removed, changed,
+    tasksAdded: added.filter(isTask), tasksRemoved: removed.filter(isTask), tasksChanged: changed.filter(isTask),
+    unchanged: Object.keys(next).length - added.length - changed.length,
+  }
+}
+
 function createProject(name, files, kanban = {}, meta = null) {
   const existing = store.listProjects()
   let id = slugify(name)
@@ -125,10 +144,55 @@ export const api = {
     return createProject(trimmed, files)
   },
 
+  // ---------- desfazer ----------
+  /** Retrato do estado do projeto antes de uma acao (quadro + campos; arquivos se pedido). */
+  async snapshot(projectId, withFiles = false) {
+    return {
+      kanban: await store.getKanban(projectId),
+      meta: await store.getMeta(projectId),
+      files: withFiles ? await filesOf(projectId) : null,
+    }
+  },
+  async restore(projectId, snap) {
+    await store.setKanban(projectId, snap.kanban)
+    await store.setMeta(projectId, snap.meta)
+    if (snap.files) await store.setFiles(projectId, snap.files)
+    return { ok: true }
+  },
+
+  // ---------- atualizar cofre (nova versao do .zip) ----------
+  /** Compara o .zip novo com o cofre atual, sem salvar nada. */
+  async previewVaultUpdate(projectId, fileOrBuffer) {
+    const current = await filesOf(projectId)
+    const next = await importZip(fileOrBuffer)
+    return diffVault(current, next)
+  },
+
+  /** Troca os arquivos mantendo quadro, campos, comentarios e historico.
+   *  Tarefas alteradas ganham uma entrada no historico. */
+  async applyVaultUpdate(projectId, fileOrBuffer) {
+    const current = await filesOf(projectId)
+    const next = await importZip(fileOrBuffer)
+    const diff = diffVault(current, next)
+    const taskMeta = await store.getMeta(projectId)
+    for (const rel of diff.changed) {
+      if (taskMeta.tasks[rel]) logChange(taskMeta.tasks[rel], { type: 'file', change: 'changed' })
+    }
+    await store.setFiles(projectId, next)
+    await store.setMeta(projectId, taskMeta)
+    store.updateProjectMeta(projectId, {
+      updatedAt: new Date().toISOString(),
+      lastUpdate: { added: diff.added.length, removed: diff.removed.length, changed: diff.changed.length },
+    })
+    await boardOf(projectId) // gera chaves das tarefas novas e limpa as removidas
+    return diff
+  },
+
   // ---------- backup / exportacao ----------
   /** .zip com os .md do cofre (incluindo edicoes feitas aqui) para devolver ao cofre real. */
   async exportZip(projectId) {
     const files = await filesOf(projectId)
+    const JSZip = await loadJSZip()
     const zip = new JSZip()
     for (const [rel, content] of Object.entries(files)) zip.file(rel, content)
     return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' })
@@ -144,6 +208,7 @@ export const api = {
       kanban: await store.getKanban(projectId),
       meta: await store.getMeta(projectId),
     }
+    store.updateProjectMeta(projectId, { lastBackupAt: data.exportedAt }) // base do lembrete de backup
     return new Blob([JSON.stringify(data)], { type: 'application/json' })
   },
 
@@ -442,17 +507,24 @@ export const api = {
   },
 
   // ---------- assistente ----------
+  // Com chave configurada usa o Claude (./browser/llm.js, carregado sob demanda);
+  // sem chave, o motor heuristico offline.
   async assistantStatus() {
-    return { llm: HAS_LLM, mode: HAS_LLM ? 'llm' : 'heuristic' }
+    const llm = HAS_LLM || llmConfigured()
+    return { llm, mode: llm ? 'llm' : 'heuristic' }
   },
 
-  async chat(projectId, question) {
+  async chat(projectId, question, history = [], onText) {
     const files = await filesOf(projectId)
-    return answer(files, question)
+    if (!llmConfigured()) return answer(files, question)
+    const { llmAnswer, llmErrorMessage } = await import('./browser/llm.js')
+    try { return await llmAnswer(files, question, history, onText) } catch (e) { throw fail(llmErrorMessage(e)) }
   },
 
   async analyze(projectId, draft) {
     const files = await filesOf(projectId)
-    return analyzeDraft(files, draft)
+    if (!llmConfigured()) return analyzeDraft(files, draft)
+    const { llmReview, llmErrorMessage } = await import('./browser/llm.js')
+    try { return await llmReview(files, draft) } catch (e) { throw fail(llmErrorMessage(e)) }
   },
 }

@@ -2,6 +2,8 @@
 import { ref, reactive, computed, watch } from 'vue'
 import { api } from '../api.js'
 import Icon from './Icon.vue'
+import FlowReports from './FlowReports.vue'
+import { download, toCsv, taskColumns, stamp } from '../browser/download.js'
 import { COLUMNS, COLUMN_LABEL, COLUMN_COLOR, LAYERS, SEV, prettyFolder, colorFor, initials, formatDue } from '../constants.js'
 
 const props = defineProps({
@@ -296,6 +298,20 @@ function onBurnMove(e) {
 }
 function onBurnLeave() { burnHover.value = -1; hideTip() }
 
+// ---------- exportacao ----------
+function exportTasks() {
+  const sprints = selectedIds.value.flatMap((id) => data[id]?.sprints || [])
+  download(toCsv(cards.value, taskColumns({ sprints, withProject: multi.value })), `insights-tarefas-${stamp()}.csv`)
+}
+function exportDocs() {
+  download(toCsv(docs.value, [
+    ...(multi.value ? [{ label: 'Projeto', value: (f) => f.pname }] : []),
+    { label: 'Documento', value: (f) => docName(f.path) }, { label: 'Pasta', value: (f) => docDir(f.path) },
+    { label: 'Críticos', value: (f) => f.red }, { label: 'Riscos', value: (f) => f.yellow }, { label: 'Melhorias', value: (f) => f.green },
+  ]), `insights-documentos-${stamp()}.csv`)
+}
+const flowSprints = computed(() => (multi.value ? [] : data[selectedIds.value[0]]?.sprints || []))
+
 // ---------- tooltip ----------
 const tip = reactive({ show: false, x: 0, y: 0, title: '', lines: [] })
 function showTip(e, title, lines) {
@@ -327,6 +343,9 @@ const flowLines = (flow, total) =>
         {{ p.name }}
         <span v-if="p.id === currentId" class="cur">atual</span>
         <Icon v-if="isSelected(p.id) && multi" name="check" :size="12" />
+      </button>
+      <button class="btn scope-csv" :disabled="!ready" title="Exportar as tarefas dos projetos selecionados" @click="exportTasks">
+        <Icon name="download" :size="13" /> CSV
       </button>
       <span class="scope-sum muted">
         {{ multi ? `${selectedIds.length} projetos · ${overview.total} tarefas` : `${overview.total} tarefas` }}
@@ -445,6 +464,8 @@ const flowLines = (flow, total) =>
           </svg>
         </template>
       </section>
+
+      <FlowReports :cards="cards" :sprints="flowSprints" style="margin-bottom:14px" @open="(path, pid) => emit('open', path, pid)" />
 
       <!-- ===== Comparativo (só com mais de um projeto) ===== -->
       <section v-if="multi" class="panel ins-panel" style="margin-bottom:14px">
@@ -631,6 +652,7 @@ const flowLines = (flow, total) =>
                 </button>
               </div>
               <div class="mini-search"><Icon name="search" :size="13" /><input v-model="docFilter.q" placeholder="Filtrar documentos" /></div>
+              <button class="btn" title="Exportar a lista filtrada" @click="exportDocs"><Icon name="download" :size="13" /> CSV</button>
             </div>
           </header>
 

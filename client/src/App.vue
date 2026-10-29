@@ -1,19 +1,26 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, defineAsyncComponent } from 'vue'
 import { api } from './api.js'
 import { COLUMNS, LAYERS, SEV, DND_TASK, DND_CARD, colorFor, initials, prettyFolder, dueState } from './constants.js'
 import Icon from './components/Icon.vue'
 import KanbanBoard from './components/KanbanBoard.vue'
 import TaskTable from './components/TaskTable.vue'
 import TaskList from './components/TaskList.vue'
-import TaskDetail from './components/TaskDetail.vue'
-import CreateTaskModal from './components/CreateTaskModal.vue'
-import ChatPanel from './components/ChatPanel.vue'
-import FileBrowser from './components/FileBrowser.vue'
 import ProjectsView from './components/ProjectsView.vue'
-import Dashboard from './components/Dashboard.vue'
-import SprintsModal from './components/SprintsModal.vue'
-import RoadmapView from './components/RoadmapView.vue'
+import { backupDue, snoozeBackup } from './browser/prefs.js'
+import { onStoreChange } from './browser/store.js'
+import { download, stamp, safeName } from './browser/download.js'
+
+// telas e janelas que nao aparecem na abertura sao carregadas sob demanda
+const lazy = (load) => defineAsyncComponent(load)
+const TaskDetail = lazy(() => import('./components/TaskDetail.vue'))
+const CreateTaskModal = lazy(() => import('./components/CreateTaskModal.vue'))
+const ChatPanel = lazy(() => import('./components/ChatPanel.vue'))
+const FileBrowser = lazy(() => import('./components/FileBrowser.vue'))
+const Dashboard = lazy(() => import('./components/Dashboard.vue'))
+const SprintsModal = lazy(() => import('./components/SprintsModal.vue'))
+const RoadmapView = lazy(() => import('./components/RoadmapView.vue'))
+const SettingsModal = lazy(() => import('./components/SettingsModal.vue'))
 
 // ---------- estado global ----------
 const projects = ref([])
@@ -45,6 +52,10 @@ const sideDropOver = ref(false)       // card do quadro sobre a sidebar (para re
 const detailPath = ref('')
 const createOpen = ref(false)
 const sprintsOpen = ref(false)
+const settingsOpen = ref(false)
+const settingsSection = ref('general')
+const sideOpen = ref(false)           // sidebar como gaveta em telas pequenas
+const prefsTick = ref(0)              // forca recalculo apos mudar configuracoes
 const helpOpen = ref(false)
 const table = ref(null)               // TaskTable (para limpar a selecao)
 const createColumn = ref('backlog')
@@ -120,10 +131,31 @@ watch(currentId, (id) => {
 watch(taskView, (v) => localStorage.setItem('cofre.view', v))
 watch(lanes, (v) => localStorage.setItem('cofre.lanes', v))
 
-function notify(msg) {
+// toast: mensagem simples ou com acao "Desfazer"
+const toastUndo = ref(null)
+let toastTimer = 0
+function notify(msg, undo = null) {
   toast.value = msg
-  setTimeout(() => { if (toast.value === msg) toast.value = '' }, 2600)
+  toastUndo.value = undo
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toast.value = ''; toastUndo.value = null }, undo ? 7000 : 2600)
 }
+
+// ---------- desfazer ----------
+// tira um retrato do projeto antes da acao; "Desfazer" (ou Ctrl+Z) restaura
+async function withUndo(msg, action, { files = false } = {}) {
+  const pid = currentId.value
+  const snap = await api.snapshot(pid, files)
+  await action()
+  notify(msg, async () => {
+    toast.value = ''
+    toastUndo.value = null
+    await api.restore(pid, snap)
+    if (pid === currentId.value) await loadProject()
+    notify('Ação desfeita')
+  })
+}
+function runUndo() { toastUndo.value?.() }
 
 // ---------- tarefas ----------
 // allCards = todas as tarefas do cofre; boardCards = so as que estao no quadro
@@ -227,12 +259,13 @@ async function moveCard(path, status, beforePath = null, patch = null) {
     try { await api.updateTask(currentId.value, path, patch) } catch (e) { notify(e.message) }
   }
   const wasOnBoard = Boolean(card.status)
+  const from = card.status
   card.status = status // otimista: colunas e sidebar derivam do status
   try {
-    if (status) await api.moveCard(currentId.value, path, status, beforePath)
-    else await api.removeFromBoard(currentId.value, path)
-    if (!status) notify('Tarefa removida do quadro')
-    else if (!wasOnBoard) notify('Tarefa adicionada ao quadro')
+    const msg = !status ? 'Tarefa removida do quadro'
+      : !wasOnBoard ? 'Tarefa adicionada ao quadro'
+      : from !== status ? `Movida para ${COLUMNS.find((c) => c.id === status).label}` : 'Ordem alterada'
+    await withUndo(msg, () => (status ? api.moveCard(currentId.value, path, status, beforePath) : api.removeFromBoard(currentId.value, path)))
     await refreshBoard() // traz a nova ordem e o historico atualizado
   } catch (e) {
     notify('Não foi possível mover: ' + e.message)
@@ -246,9 +279,8 @@ async function setWip(column, limit) {
 
 async function onBulk(paths, patch) {
   try {
-    const r = await api.bulkUpdate(currentId.value, paths, patch)
+    await withUndo(`${paths.length} tarefa(s) atualizada(s)`, () => api.bulkUpdate(currentId.value, paths, patch))
     await refreshBoard()
-    notify(`${r.count} tarefa(s) atualizada(s)`)
     // tirar do quadro remove as tarefas da tabela; a selecao se ajusta sozinha
   } catch (e) { notify(e.message) }
 }
@@ -257,15 +289,17 @@ async function onBulk(paths, patch) {
 const SHORTCUTS = [
   ['c', 'Criar tarefa'], ['/', 'Buscar'], ['1', 'Kanban'], ['2', 'Tabela'], ['3', 'Lista'], ['4', 'Roadmap'],
   ['g t', 'Ir para Tarefas'], ['g d', 'Ir para Docs'], ['g i', 'Ir para Insights'], ['g p', 'Ir para Projetos'],
-  ['s', 'Gerenciar sprints'], ['a', 'Abrir/fechar assistente'], ['?', 'Mostrar atalhos'], ['Esc', 'Fechar janela / limpar seleção'],
+  ['s', 'Gerenciar sprints'], ['Ctrl Z', 'Desfazer a última ação'], ['a', 'Abrir/fechar assistente'], [',', 'Configurações'], ['?', 'Mostrar atalhos'], ['Esc', 'Fechar janela / limpar seleção'],
 ]
 let gPending = 0
 function onGlobalKey(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && toastUndo.value
+    && !['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) { e.preventDefault(); runUndo(); return }
   if (e.ctrlKey || e.metaKey || e.altKey) return
   const el = e.target
   if (el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) return
   // com janela aberta, cada janela cuida das proprias teclas
-  if (detailPath.value || createOpen.value || sprintsOpen.value) return
+  if (detailPath.value || createOpen.value || sprintsOpen.value || settingsOpen.value) return
   if (helpOpen.value) { if (e.key === 'Escape' || e.key === '?') helpOpen.value = false; return }
   if (e.key === 'Escape') { table.value?.clearSel(); showFilter.value = false; return }
   if (!hasProjects.value) return
@@ -278,6 +312,7 @@ function onGlobalKey(e) {
   const k = e.key
   if (k === 'g') { gPending = Date.now(); return }
   if (k === '?') { e.preventDefault(); helpOpen.value = true; return }
+  if (k === ',') { e.preventDefault(); openSettings(); return }
   if (k === '/') { e.preventDefault(); document.querySelector('.side-search input')?.focus(); return }
   if (!current.value) return
   if (k === 'c') { e.preventDefault(); go('tasks'); newTask() }
@@ -301,10 +336,13 @@ async function onTaskCreated(path) {
   notify('Tarefa criada')
   detailPath.value = path
 }
-async function onTaskDeleted() {
+// exclusao com desfazer (o retrato inclui os arquivos do cofre)
+async function deleteTask(path) {
   detailPath.value = ''
-  await loadProject()
-  notify('Tarefa excluída')
+  try {
+    await withUndo('Tarefa excluída', () => api.remove(currentId.value, path), { files: true })
+    await loadProject()
+  } catch (e) { notify(e.message) }
 }
 
 function clearFilters() {
@@ -323,7 +361,47 @@ function go(s) {
 function selectProject(id) {
   if (id !== currentId.value) currentId.value = id
   section.value = 'tasks'
+  sideOpen.value = false
 }
+
+function openSettings(sec = 'general') { settingsSection.value = sec; settingsOpen.value = true }
+
+// projetos mudaram por fora (atualizacao do cofre, sincronizacao, importacao)
+async function onProjectsChanged() {
+  for (const id of Object.keys(projectData)) delete projectData[id]
+  await loadProjects()
+  await loadProject()
+  prefsTick.value++
+}
+
+// ---------- lembrete de backup ----------
+const backupReminder = computed(() => { prefsTick.value; return backupDue(projects.value) })
+async function backupNow(p) {
+  try {
+    download(await api.exportBackup(p.id), `${safeName(p.name)}-${stamp()}.cofre.json`)
+    await loadProjects()
+    notify(`Backup de "${p.name}" baixado`)
+  } catch (e) { notify(e.message) }
+}
+function snooze() { snoozeBackup(24); prefsTick.value++ }
+
+// ---------- sincronizacao automatica (opcional) ----------
+let offStore = () => {}
+async function startSync() {
+  offStore()
+  let cfg = {}
+  try { cfg = JSON.parse(localStorage.getItem('cofre.sync') || '{}') } catch { /* sem config */ }
+  if (!cfg.url || !cfg.anonKey) return
+  const sync = await import('./browser/sync.js')
+  await sync.getUser() // conclui o login vindo do link magico, se houver
+  offStore = onStoreChange((id) => sync.scheduleAutoPush(id, (err) => {
+    if (err?.code === 'conflict') notify('Há uma versão mais nova na nuvem. Abra Configurações > Sincronização.')
+    else if (err) notify('Falha ao sincronizar: ' + err.message)
+    else loadProjects()
+  }))
+}
+onMounted(startSync)
+onBeforeUnmount(() => offStore())
 
 function toggleFav(id) {
   const s = new Set(favorites.value)
@@ -467,10 +545,12 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
       <div class="rail-item" :class="{ active: section === 'insights', disabled: !hasProjects }" @click="go('insights')"><Icon name="chart" :size="18" />Insights</div>
       <div class="grow"></div>
       <div class="rail-item" :class="{ active: chatOpen, disabled: !current }" @click="current && (chatOpen = !chatOpen)"><Icon name="sparkle" :size="18" />Assist.</div>
+      <div class="rail-item" :class="{ active: settingsOpen }" title="Configurações" @click="openSettings()"><Icon name="settings" :size="18" />Config.</div>
     </nav>
+    <div v-if="sideOpen" class="side-backdrop" @click="sideOpen = false"></div>
 
     <!-- ===== Sidebar ===== -->
-    <aside class="side">
+    <aside class="side" :class="{ open: sideOpen }">
       <div class="side-search">
         <div class="field">
           <Icon name="search" :size="14" />
@@ -593,6 +673,7 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
     <main class="main">
       <header class="header">
         <div class="header-top">
+          <button class="icon-btn menu-btn" title="Menu" aria-label="Abrir menu" @click="sideOpen = !sideOpen"><Icon name="list" :size="18" /></button>
           <!-- Insights pode cobrir varios projetos: o escopo fica na propria tela -->
           <template v-if="section === 'insights' && current">
             <div class="project-avatar" style="background: var(--accent)"><Icon name="chart" :size="18" /></div>
@@ -684,7 +765,7 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
               <div v-for="(label, key) in { all: 'Todas', red: 'Crítico', yellow: 'Risco', green: 'Melhoria', none: 'Sem apontamento' }" :key="key"
                 class="opt" :class="{ on: filters.severity === key }" @click="filters.severity = key">
                 <Icon v-if="filters.severity === key" name="check" :size="14" />
-                <span v-else class="sev-dot" :style="{ background: SEV[key]?.color || '#55565d', margin: '0 3.5px' }"></span>
+                <span v-else class="sev-dot" :style="{ background: SEV[key]?.color || 'var(--line-strong)', margin: '0 3.5px' }"></span>
                 {{ label }}
               </div>
               <template v-if="assignees.length">
@@ -715,8 +796,23 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
       <div class="body">
         <p v-if="error" class="err">{{ error }}</p>
 
+        <div v-if="backupReminder.length" class="backup-banner" role="status">
+          <Icon name="archive" :size="16" />
+          <span v-if="backupReminder.length === 1">
+            <b>{{ backupReminder[0].name }}</b> {{ backupReminder[0].never ? 'nunca teve backup' : `está há ${backupReminder[0].days} dias sem backup` }}.
+            Os dados ficam só neste navegador.
+          </span>
+          <span v-else><b>{{ backupReminder.length }} projetos</b> estão sem backup recente. Os dados ficam só neste navegador.</span>
+          <span class="bb-actions">
+            <button v-for="p in backupReminder.slice(0, 3)" :key="p.id" class="btn" @click="backupNow(p)">
+              <Icon name="download" :size="13" /> {{ backupReminder.length === 1 ? 'Fazer backup agora' : p.name }}
+            </button>
+            <button class="btn-ghost" @click="snooze">Lembrar amanhã</button>
+          </span>
+        </div>
+
         <ProjectsView v-if="section === 'home'" :projects="projects" :current-id="currentId" :favorites="favorites"
-          :add-signal="addProjectSignal" @select="selectProject" @changed="loadProjects" @toggle-fav="toggleFav" />
+          :add-signal="addProjectSignal" @select="selectProject" @changed="onProjectsChanged" @toggle-fav="toggleFav" @notify="notify" />
 
         <div v-else-if="!current" class="empty">Nenhum projeto selecionado. Adicione um cofre em <b>Início</b>.</div>
 
@@ -745,7 +841,7 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
 
       <!-- Chat flutuante -->
       <ChatPanel v-if="chatOpen && current" :project-id="currentId" :project-name="current.name" :seed="chatSeed"
-        @close="chatOpen = false" @open-doc="openDoc" @consumed="chatSeed = null" />
+        @close="chatOpen = false" @open-doc="openDoc" @consumed="chatSeed = null" @settings="openSettings('ai')" />
       <button v-if="current" class="fab" :class="{ ai: !chatOpen }" :title="chatOpen ? 'Fechar assistente' : 'Assistente'" @click="chatOpen = !chatOpen">
         <Icon :name="chatOpen ? 'x' : 'sparkle'" :size="18" />
       </button>
@@ -754,12 +850,15 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
     <!-- Modais -->
     <TaskDetail v-if="detailPath && current" :project-id="currentId" :path="detailPath" :cards="allCards"
       :assignees="assignees" :labels="labels" :sprints="sprints"
-      @close="detailPath = ''" @move="moveCard" @saved="loadProject" @updated="refreshBoard" @deleted="onTaskDeleted"
+      @close="detailPath = ''" @move="moveCard" @saved="loadProject" @updated="refreshBoard" @delete="deleteTask"
       @ask="askAboutTask" @open-doc="openDoc" />
 
     <CreateTaskModal v-if="createOpen && current" :project-id="currentId" :categories="categories"
       :initial-column="createColumn" :initial-feature="filters.feature"
       @close="createOpen = false" @created="onTaskCreated" @open-doc="openDoc" />
+
+    <SettingsModal v-if="settingsOpen" :projects="projects" :section="settingsSection"
+      @close="settingsOpen = false" @changed="onProjectsChanged(); startSync()" @notify="notify" />
 
     <SprintsModal v-if="sprintsOpen && current" :project-id="currentId" :sprints="sprints" :cards="allCards"
       @close="sprintsOpen = false" @changed="refreshBoard" />
@@ -777,6 +876,9 @@ const SECTION_TITLE = { home: 'Projetos', insights: 'Insights', docs: 'Documento
       </div>
     </div>
 
-    <div v-if="toast" class="toast">{{ toast }}</div>
+    <div v-if="toast" class="toast" role="status">
+      {{ toast }}
+      <button v-if="toastUndo" class="toast-undo" @click="runUndo">Desfazer</button>
+    </div>
   </div>
 </template>

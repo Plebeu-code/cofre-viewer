@@ -42,8 +42,10 @@ function metaOf(content) {
   const checkTotal = (c.match(/^\s*- \[[ xX]\]/gm) || []).length
   const checkDone = (c.match(/^\s*- \[[xX]\]/gm) || []).length
   const ids = [...new Set(c.match(/\b(FRONT|BACK|INT)-\d+\b/g) || [])]
+  // IDs que aparecem em titulos (# ...) sao os que a tarefa "define"; os demais sao citacoes
+  const headingIds = c.split(/\r?\n/).filter((l) => /^#/.test(l)).join(' ').match(/\b(FRONT|BACK|INT)-\d+\b/g) || []
 
-  return { severity, red, yellow, green, heading: h1.trim(), excerpt, checkTotal, checkDone, ids }
+  return { severity, red, yellow, green, heading: h1.trim(), excerpt, checkTotal, checkDone, ids, headingIds }
 }
 
 /** Ordem de exibicao: posicao manual (rank) primeiro; sem rank, por pasta e nome. */
@@ -85,6 +87,8 @@ export function buildBoard(files, statusMapInput, metaInput, keyPrefix = 'TSK') 
     const short = name.includes(' — ') ? name.split(' — ').slice(1).join(' — ') : name
     const kind = name.includes(' — ') ? name.split(' — ')[0] : ''
     const t = taskMeta.tasks[rel] || {}
+    meta.defines = [...new Set([...(name.match(/\b(FRONT|BACK|INT)-\d+\b/g) || []), ...meta.headingIds])]
+    delete meta.headingIds
     return {
       path: rel, title: short, kind, fileName: name, feature: folder, group, layer: classifyLayer(name), status, ...meta,
       key: t.key, priority: t.priority || null, due: t.due || null, assignee: t.assignee || '',
@@ -93,6 +97,8 @@ export function buildBoard(files, statusMapInput, metaInput, keyPrefix = 'TSK') 
       commentCount: (t.comments || []).length,
       // quando foi concluida (ultima entrada em "feito"), base do burndown
       doneAt: status === 'feito' ? [...(t.history || [])].reverse().find((h) => h.type === 'status' && h.to === 'feito')?.at || null : null,
+      // linha do tempo de status (fluxo cumulativo e tempo de ciclo)
+      statusLog: (t.history || []).filter((h) => h.type === 'status').map((h) => ({ at: h.at, to: h.to })),
     }
   }).sort(compareCards)
 
